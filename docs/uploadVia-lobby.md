@@ -1,4 +1,10 @@
-# uploadVia lobby — Replay Upload over HTTP POST
+# uploadVia lobby - Replay Upload over HTTP POST
+
+> **Historical.** This document describes the `-uploadVia=lobby` method of the
+> original `BattleServer.exe`. **This implementation does not upload replays**: the
+> flags are accepted and ignored, and no connection is opened to a replay host. The
+> HTTP contract below is kept as the record of the original, and the
+> `BattleServer.exe` launch examples are the original's, not this server's.
 
 ## Description
 
@@ -84,8 +90,8 @@ Content-Length: <length>\r\n
 ### Error Handling
 
 - **Original behavior: no retry** — if the original upload fails, the replay is
-  lost. The Go reimplementation retries once after a connection or send failure;
-  see `src_go/internal/replay/uploader.go:301-310` and its test.
+  lost. This implementation does not upload at all; the uploader that used to retry
+  once has been removed.
 - A C++ exception is thrown (`_CxxThrowException`)
 - The server keeps working (only that upload fails)
 

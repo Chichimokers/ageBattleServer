@@ -14,7 +14,9 @@ The heartbeat/lobby connection (`lobbyHost:lobbyPort`) **has no relation whatsoe
 replay upload system (`-uploadVia`). They are two completely separate subsystems:
 
 - **Lobby Heartbeat** → server registration, session management, relay between peers
-- **Replay Upload** → replay upload (HTTP POST / MySQL / ODBC)
+- **Replay Upload** → replay upload (HTTP POST / MySQL / ODBC) in the original; **not
+  implemented in this server**, where the flags are accepted and ignored and no connection is
+  opened
 
 **There is no dependency**: the upload works without the lobby, and the lobby works without the upload. The term "lobby" in `uploadVia=lobby` is only a historical name for the worldwide HTTP method.
 

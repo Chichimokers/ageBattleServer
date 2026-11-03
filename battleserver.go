@@ -1,7 +1,6 @@
 // Package battleserver exposes the ageLAN BattleServer as an embeddable
 // library. A host program can construct a Config, start the server with
-// Run/Start, and receive recorded game data through a callback instead of
-// (or in addition to) the cloud replay upload.
+// Run/Start, and receive recorded game data through a callback.
 package battleserver
 
 import (
@@ -58,14 +57,6 @@ type Config struct {
 	// SSLCert and SSLKey configure TLS for the listeners.
 	SSLCert string
 	SSLKey  string
-	// UploadVia selects the replay upload transport. Only "lobby" is
-	// supported; empty disables the upload. Ignored when ReplayDataHandler
-	// is set.
-	UploadVia string
-	// ReplayHost and ReplayPort are the target of the replay upload when
-	// UploadVia is "lobby". Ignored when ReplayDataHandler is set.
-	ReplayHost string
-	ReplayPort uint
 	// Region is the server region advertised to the lobby.
 	Region string
 	// ObserverMax is the maximum number of observers per session.
@@ -104,8 +95,7 @@ type Config struct {
 	// LogModLevel is the per-module level used with LogModName.
 	LogModLevel string
 	// ReplayDataHandler, when set, receives every replay data chunk internally.
-	// It takes precedence over the cloud upload: UploadVia, ReplayHost and
-	// ReplayPort are ignored and no uploader is started.
+	// It runs on the sending connection's goroutine.
 	ReplayDataHandler ReplayDataHandler
 	// EphemeralListenPorts asks the operating system for the listen port of each
 	// transport it names, instead of taking it from BsPort and WebSocketPort, and
@@ -175,9 +165,6 @@ func New(cfg Config) (*Server, error) {
 		PublicPort:               cfg.PublicPort,
 		SSLCert:                  cfg.SSLCert,
 		SSLKey:                   cfg.SSLKey,
-		UploadVia:                cfg.UploadVia,
-		ReplayHost:               cfg.ReplayHost,
-		ReplayPort:               cfg.ReplayPort,
 		Region:                   cfg.Region,
 		ObserverMax:              cfg.ObserverMax,
 		ObserverUpdateIntervalMS: cfg.ObserverUpdateIntervalMS,
@@ -200,11 +187,6 @@ func New(cfg Config) (*Server, error) {
 		EphemeralListenPorts:     cfg.EphemeralListenPorts,
 	}
 	if cfg.ReplayDataHandler != nil {
-		// The callback takes over replay delivery: the cloud upload
-		// configuration is ignored and no uploader is started.
-		innerCfg.UploadVia = ""
-		innerCfg.ReplayHost = ""
-		innerCfg.ReplayPort = 0
 		handler := cfg.ReplayDataHandler
 		innerCfg.ReplayDataHandler = func(sessionID uint64, data []byte) {
 			handler(ReplayData{SessionID: sessionID, Data: data})
@@ -232,12 +214,6 @@ func (s *Server) Run(ctx context.Context) error {
 // Stop shuts down every listener and background loop started by Start.
 func (s *Server) Stop() error {
 	return s.inner.Stop()
-}
-
-// ReplayUploadEnabled reports whether the server is configured to upload
-// replays to the cloud. It is always false when a ReplayDataHandler is set.
-func (s *Server) ReplayUploadEnabled() bool {
-	return s.inner.ReplayUploader() != nil
 }
 
 // BoundPorts reports the TCP ports the two game listeners are listening on, and

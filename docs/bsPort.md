@@ -389,7 +389,7 @@ Client                                    Server (bsPort)
 | `-lobbyPort` | TCP | Heartbeat with the lobby server |
 | `-outOfBandPort` | TCP | OOB ping (OutOfBandServer) |
 | `-relayBroadcastPort` | UDP | Presence broadcast |
-| `-replayHost:replayPort` | TCP | Replay upload |
+| `-replayHost:replayPort` | TCP | Replay upload (not implemented here: no outbound connection is opened) |
 
 ---
 

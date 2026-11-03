@@ -1,4 +1,9 @@
-# uploadVia lobby — Why the Connection Stays "Deferred"
+# uploadVia lobby - Why the Connection Stays "Deferred"
+
+> **Historical.** This document diagnoses the original `BattleServer.exe`, which
+> opened the replay socket and never completed the connection nor sent a request.
+> **This implementation does not upload replays** and does not open that socket at
+> all; the flags are accepted and ignored.
 
 ## The Problem
 

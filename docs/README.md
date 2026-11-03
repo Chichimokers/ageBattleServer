@@ -39,10 +39,10 @@ criterion that decides which register an entry belongs to is stated at the top o
 | [`relay.md`](relay.md) | **the presence beacon** — the UDP announcement, `-relayBroadcastPort` |
 | [`LOBBY-PROTOCOL.md`](LOBBY-PROTOCOL.md) | the heartbeat with the lobby |
 | [`MESSAGES.md`](MESSAGES.md) | the table of message types, and where each number comes from |
-| [`replays.md`](replays.md) | replay generation and the HTTP upload |
-| [`uploadVia-lobby.md`](uploadVia-lobby.md) | `-uploadVia=lobby`, the **only** method the server accepts |
-| [`uploadVia-lobby-connection.md`](uploadVia-lobby-connection.md) | the "connect deferred" diagnosis |
-| [`uploadVia-lobby-state.md`](uploadVia-lobby-state.md) | connection states and the conditions for an upload |
+| [`replays.md`](replays.md) | the original's replay pipeline and HTTP upload (this server does not upload) |
+| [`uploadVia-lobby.md`](uploadVia-lobby.md) | the original's `-uploadVia=lobby`; the flags are accepted and ignored here |
+| [`uploadVia-lobby-connection.md`](uploadVia-lobby-connection.md) | the original's "connect deferred" diagnosis |
+| [`uploadVia-lobby-state.md`](uploadVia-lobby-state.md) | the original's connection states and upload conditions |
 | [`INTENTIONAL-DIVERGENCES.md`](INTENTIONAL-DIVERGENCES.md) | differences we **chose**, each with its reason and its evidence |
 | [`UNINTENTIONAL-DIVERGENCES.md`](UNINTENTIONAL-DIVERGENCES.md) | the open bugs, the unexplained gaps, and the questions with no answer |
 | [`PENDING.md`](PENDING.md) | what is missing, split by **who can resolve it** |
@@ -71,11 +71,11 @@ document; `SESSION-JOURNAL.md` cites it.
 
 ### Three documents that used to be here and are not
 
-- **Replay upload via MySQL, and via an ODBC driver.** Both are gone. The server
-  **rejects** `-uploadVia=mysql` and `-uploadVia=odbc` with an error and `os.Exit(1)`
-  (`src_go/internal/config/config.go:117-125`), and a document describing a supported method
-  that the server refuses is worse than no document. `lobby` is the only method it accepts,
-  and the three `uploadVia-lobby*` documents cover it.
+- **Replay upload via MySQL, and via an ODBC driver.** Both are gone. The three
+  `uploadVia-lobby*` documents and `replays.md` describe the original's pipeline; **this
+  server does not upload replays at all**. The original's replay flags are still
+  registered, are accepted with any value and are ignored, and the `mysql`/`odbc`
+  documents were never recoverable enough to keep.
 - **The proxy-capture validation walkthrough.** Gone. It described a capture layout
   (`main_log_*.csv` with a `data_b64` column) that the proxy stopped writing; the layout
   today is in [`CAPTURES.md`](CAPTURES.md) and the validation is the `internal/sim` harness.
@@ -94,7 +94,7 @@ document; `SESSION-JOURNAL.md` cites it.
 | **outOfBandPort** | TCP | the latency ping | [`oob.md`](oob.md) |
 | **relayBroadcastPort** | **UDP** | the presence beacon | [`relay.md`](relay.md) |
 | **lobbyPort** | TCP, 8443 | the heartbeat with the lobby | [`LOBBY-PROTOCOL.md`](LOBBY-PROTOCOL.md) |
-| replay upload | HTTP POST, **plain** | the replay body | [`replays.md`](replays.md) |
+| replay upload (not implemented; original only) | HTTP POST, **plain** | the replay body | [`replays.md`](replays.md) |
 
 Two of these are easy to confuse and are repeatedly confused in the notes:
 
@@ -102,8 +102,8 @@ Two of these are easy to confuse and are repeatedly confused in the notes:
   discover the server. The lobby connection is a TCP conversation the server makes to
   register itself and stay alive.
 - **`uploadVia=lobby` is not the lobby either.** "lobby" there is a historical name for the
-  worldwide HTTP method, and it has nothing to do with `lobbyHost:lobbyPort`. The endpoint is
-  `POST /game/replay/setReplayData`.
+  original's worldwide HTTP method, and it has nothing to do with `lobbyHost:lobbyPort`.
+  The endpoint was `POST /game/replay/setReplayData`; this server no longer connects to it.
 
 ### The beacon, in one paragraph
 
@@ -145,7 +145,7 @@ anywhere, they are constants in that block.
 | `-region` | `"global"` | `:307` |
 | `-muninReportDelay` | `60000` | `:335` |
 | `-sslCert`, `-sslKey` | — | paths; the pair is only read for the WebSocket listener |
-| `-uploadVia` | — | **`lobby` is the only accepted value** |
+| `-uploadVia` | — | accepted with any value and ignored: the upload is not implemented |
 | `-?`, `-h`, `-help` | — | prints usage and exits (`main_1400d1310.cpp:689-698`) |
 
 Three things that are true of the original and are worth knowing before reading the code:
@@ -153,8 +153,9 @@ Three things that are true of the original and are worth knowing before reading 
 - **`-webSocketPort` defaults to 0**, and 0 means the WebSocket listener is not built at all
   (`sub_1400D6790:291-300`). Rule 3 of [`AGENTS.md`](AGENTS.md) holds it at 0 in every test
   for that reason.
-- **`-uploadVia` accepts `lobby` and nothing else.** `mysql` and `odbc` reach
-  `os.Exit(1)`.
+- **`-uploadVia` accepts any value and does nothing.** The original's replay upload is not
+  implemented here, so `mysql`, `odbc`, `lobby` and anything else all start the server. The
+  flags stay registered because an original launcher passes them.
 - **The help text is four lines** (`main_1400d1310.cpp:691-697`): name, simulation period,
   bsPort, relayBroadcastPort. The other flags are undocumented in the original and are
   documented here or in their own document.

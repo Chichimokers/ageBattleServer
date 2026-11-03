@@ -231,44 +231,9 @@ their commit, live in `SESSION-JOURNAL.md §16.3` and in the history of `src_go`
 - **Evidence**: `sub_1400E2590:314-320` (the sixteen calls) and `sub_1400E34F0:124-231`
   (the copy of one chunk). `SESSION-JOURNAL.md §33` ("what is left undone").
 
-### 4.2 The replay uploader is not fed from `0x13`
-
-- **What diverges**: `ReplayUploadManager::OnReceivePacket` (`sub_14010F4F0`) is called from
-  the dispatcher in **two** places: `sub_1400DE050:529` (`0x10` ProxyMessage case) and
-  `sub_1400DE050:616` (`0x13` LobbyRelayMessage case). Our only entry point into the
-  uploader is `handleProxyData`, which only fires with `0x10`. What is visible from outside
-  is the POST to the replay host: there is one request fewer.
-- **Reason**: the exact byte range that would be uploaded in the `0x13` case depends on a
-  question that is **not** this file's and is open
-  ([`UNINTENTIONAL-DIVERGENCES.md`](UNINTENTIONAL-DIVERGENCES.md) point 1),
-  and on whether it is better to re-serialise or to forward the bytes as they are. Since
-  both are backed, doing them at once without evidence would be taking the risk twice.
-- **Evidence**: `sub_1400DE050:529` and `:616`; the original **re-serialises** the `0x13` with
-  `RLink::SessionMessage::LobbyRelayMessage__vmethod_18` at `:596`, just before the
-  second call, and out of that re-serialisation come the pointer and the size that are
-  passed (`:602` and `:601`). `SESSION-JOURNAL.md §16.2b`.
-
----
-
-## 5. The upload without a session is discarded
-
-- **What diverges**: without a session there is no `matchid` to hang the replay on and the
-  packet is thrown away: no POST reaches the replay host. The original, with the same lack
-  of session, would reach the uploader and upload a batch with whatever id it had at hand.
-- **Reason**: instead of slipping into a shared `matchid`, which is what it used to do and
-  what produced `matchid=0` for every match and interleaved them all into one file on the
-  host.
-- **Evidence**: `internal/server/handlers.go` (`handleProxyData`: with `sess == nil` it logs
-  and skips `replayUploader.OnProxyData`); the `matchid` is the sessionID, which the
-  original takes from `session+2104` and writes into `batch+0x10000`
-  (`sub_1400E7500:33`, and `WWBS::WorldwideReplayUpload__vmethod_30:30`). `SESSION-JOURNAL.md §16.1`
-  point 8, and the `1addadf` bug in `§16.3`.
-
----
-
 ## 6. What is wire-visible and accepted, and why
 
-These three read as "different" and they **are** wire-visible differences: a client or the
+These read as "different" and they **are** wire-visible differences: a client or the
 harness can count them. What they are not is **bugs**, and each one carries the reason it is
 accepted. Writing them here is the only way of keeping them from showing up as a finding in
 the unintentional file, and saying so is what keeps this file honest: the difference between
@@ -291,19 +256,20 @@ not need one.
   `battle-server.txt`: `Socks::AnimateAll` exits **78** times, of which
   **70** are `Wait for IO complete; timeoutMS=1300` (the other 8 are `sendwait` and
   `shutdown request`). `SESSION-JOURNAL.md §6`.
-- **The byte range of the replay upload.** We upload **the body of the message, from the type
-  byte onwards**. What the original would upload was never observed, because **the original
-  does not upload**: the user ran it with a listener on the replay host, with
-  `-uploadVia=lobby`, and **the TCP connection arrived and no request ever followed** — not
-  with a short run, and not with a match played to the end. The only recorded run of the
-  original agrees: `battle-server.txt:18` shows the uploader being built
+- **The replay socket is never opened.** The original built the uploader and opened a TCP
+  connection to `-replayHost:-replayPort` at start-up, but **the original does not actually
+  upload**: the user ran it with a listener on the replay host, with `-uploadVia=lobby`, and
+  **the TCP connection arrived and no request ever followed** — not with a short run, and not
+  with a match played to the end. `battle-server.txt:18` shows the uploader being built
   (`instantiating WorldwideReplayUpload @ 127.0.0.1:8443`) and `:23` the connect being
-  *deferred and never completed*, with no request in the remaining 423 lines. **Reason**: with
-  no request from the original there is nothing to be byte-identical to, so the choice stops
-  being a fidelity question and becomes a design one, and the one that does not throw the
-  replay away is kept. **What is therefore ours and unverified**: the choice of slice. The rest
-  of the request is not a reading — it is established from the binary and compared by a test
-  (`TestReplayUploadRequestShapeAndPayload`). `SESSION-JOURNAL.md` §52.
+  *deferred and never completed*, with no request in the remaining 423 lines. **Reason**: the
+  only artefact the original produced there was a connect that carried no byte, so there is
+  nothing on that wire to be faithful to, and this implementation does not upload at all. The
+  replay data is still produced and handed to the embedding host through
+  `ReplayDataHandler`, and the observer frame store is untouched. The original's seven replay
+  flags stay registered, are accepted with any value and are ignored. **Evidence**: the
+  measurement above, `battle-server.txt:18,23`, `SESSION-JOURNAL.md` §52, and
+  `PLAN-replay-upload-removal.md`.
 
 ---
 
@@ -383,6 +349,9 @@ is" column says where it is now held to account.
 | The observer list is emptied when it is cleared | **no**: it is memory. What goes on the wire —the `0x19` = 4 to each observer and the close— is done the same way, and the entry goes the same way when the connection drops | `SESSION-JOURNAL.md §36.1` and `§32.5`, and the code (`tickLocked`) |
 | `Session.Tick` does not return the two status bytes of `E2590:483` | **no**: only the munin reads them (`sub_1400E9E90:69-71`, `HIBYTE(v41)` accumulated and `LOBYTE` tested), which does not travel. The high byte also **can never be set**: `E2590:285-286` writes it only if `v28 == 0`, and the only `++` of the field is at `:380`, after | `SESSION-JOURNAL.md §36.3` |
 | The observer step: whether the original serves the freshly activated one in the same tick | **closed on 2026-10-05 by reading the binary**: it does **not**, and there is no arm that could, because `sub_1400E43E0` builds exactly one message (the `0x1E`) and never calls the two functions that fetch frames from the store. What the step costs is `interval+1` ticks, which `internal/session`'s `TestTheWorstPhaseCostsTheWholePeriod` measures | nothing to relocate. The record is [`UNINTENTIONAL-DIVERGENCES.md`](UNINTENTIONAL-DIVERGENCES.md) 6 and [`SESSION-JOURNAL.md`](SESSION-JOURNAL.md) §44.4 |
+| The `0x13` does not feed the replay uploader (§4.2) | **no**: the uploader no longer exists, so neither `0x10` nor `0x13` builds a POST | this file §6, "The replay socket is never opened" |
+| An upload without a session is discarded (§5) | **no**: there is no upload to discard | this file §6, "The replay socket is never opened" |
+| The byte range of the replay upload (a §6 bullet) | **no**: no request is sent, so there is no body to range over | this file §6, "The replay socket is never opened" |
 
 ---
 
@@ -406,7 +375,6 @@ or the documented command line, and none of them is a developer diagnostic.
 | `RSA PRIVATE KEY` | the PEM parser | the PEM label |
 | `-maxPagesToStorePerSession` | the operator | the upstream flag name, registered as an **alias** so a launcher that passes it is not rejected. `internal/config/config.go` |
 | `-simulationPeriod`, `-observerUpdateIntervalMS`, `-observerSocketSkipMS`, `-logMod`, `-logModLevel` | the operator | the upstream flag names, for the same reason |
-| `/game/replay/setReplayData` | the replay host | the endpoint path, which is the upload contract |
 | `255.255.255.255` | the relay beacon | the broadcast address the beacon goes to |
 
 **What was removed, for contrast**, and each of these *was* a developer diagnostic with no

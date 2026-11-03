@@ -863,13 +863,12 @@ func TestConfigFromRecordedArgs(t *testing.T) {
 	}
 }
 
-// TestConfigFromRecordedArgsRefusesACommandLineThatNeverRan: -help, an
-// unsupported -uploadVia and -simulationPeriod 0 with an observer interval all
-// make the real binary exit, so a capture carrying them describes nothing.
+// TestConfigFromRecordedArgsRefusesACommandLineThatNeverRan: -help and
+// -simulationPeriod 0 with an observer interval both make the real binary exit,
+// so a capture carrying them describes nothing.
 func TestConfigFromRecordedArgsRefusesACommandLineThatNeverRan(t *testing.T) {
 	for name, args := range map[string][]string{
 		"help":           {"-help", "-bsPort", "14001"},
-		"uploadVia":      {"-uploadVia", "mysql"},
 		"simulationZero": {"-simulationPeriod", "0", "-observerUpdateIntervalMS", "8"},
 		"missingValue":   {"-bsPort", "not-a-number"},
 	} {

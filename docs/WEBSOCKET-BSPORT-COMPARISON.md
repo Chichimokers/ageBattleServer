@@ -80,7 +80,8 @@ Both ports share the same session infrastructure:
 
 - **SessionManager**: one for both ports
 - **Peer management**: the same peer system
-- **Replay upload**: both generate the same replay data
+- **Replay upload**: both generate the same replay data (this describes the original; this
+  server does not upload and delivers the data through an in-process callback)
 - **Metrics**: they share global counters
 
 ### 3. Same Packet Processing
