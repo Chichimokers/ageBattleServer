@@ -74,37 +74,6 @@ func TestNewAndRunCancelled(t *testing.T) {
 	}
 }
 
-func TestReplayUploadWithCallbackDisabled(t *testing.T) {
-	cfg := DefaultConfig()
-	cfg.UploadVia = "lobby"
-	cfg.ReplayHost = "127.0.0.1"
-	cfg.ReplayPort = 1
-	cfg.ReplayDataHandler = func(ReplayData) {}
-
-	srv, err := New(cfg)
-	if err != nil {
-		t.Fatalf("New error: %v", err)
-	}
-	if srv.ReplayUploadEnabled() {
-		t.Error("replay upload should be disabled when a ReplayDataHandler is set")
-	}
-}
-
-func TestReplayUploadWithoutCallback(t *testing.T) {
-	cfg := DefaultConfig()
-	cfg.UploadVia = "lobby"
-	cfg.ReplayHost = "127.0.0.1"
-	cfg.ReplayPort = 1
-
-	srv, err := New(cfg)
-	if err != nil {
-		t.Fatalf("New error: %v", err)
-	}
-	if !srv.ReplayUploadEnabled() {
-		t.Error("replay upload should be enabled when no ReplayDataHandler is set")
-	}
-}
-
 func TestReplayDataHandlerEndToEnd(t *testing.T) {
 	received := make(chan ReplayData, 1)
 	cfg := DefaultConfig()

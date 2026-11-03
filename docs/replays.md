@@ -1,4 +1,12 @@
-# Replay System — Extensive Documentation
+# Replay System - Extensive Documentation
+
+> **Historical.** This document describes the replay pipeline of the original
+> `BattleServer.exe`. **This implementation does not upload replays**: the
+> replay-upload flags (`-uploadVia`, `-replayHost`, `-replayPort`, `-login`,
+> `-password`, `-replayDBName`, `-odbcDriver`) are still accepted and are ignored,
+> and the server never opens a connection to a replay host. The in-process
+> `ReplayDataHandler` callback is the remaining way a host receives recorded data.
+> What follows is kept because it is the only record of the request builder.
 
 ## General Description
 
@@ -814,8 +822,9 @@ if (queue_end == queue_capacity) {
 ### Behaviour on Errors
 
 - **Original behavior: no retry**: If the original HTTP send fails, the replay is
-  lost. The Go reimplementation retries once after a connection or send failure;
-  see `src_go/internal/replay/uploader.go:301-310`.
+  lost. The Go reimplementation used to retry once after a connection or send
+  failure; that uploader has since been removed, so this server does not upload at
+  all.
 - **C++ exception**: `_CxxThrowException` propagates the error
 - **The server keeps working**: only that specific upload fails
 - **Automatic reconnection**: If the TCP connection is lost, it tries to reconnect every 5000ms

@@ -1,4 +1,8 @@
-# uploadVia lobby — Connection State and Upload Requirements
+# uploadVia lobby - Connection State and Upload Requirements
+
+> **Historical.** This document describes the original `BattleServer.exe`'s replay
+> connection state machine. **This implementation does not upload replays**: the
+> flags are accepted and ignored, and no connection is opened to a replay host.
 
 ## The Problem: A Connection Open With No Data
 

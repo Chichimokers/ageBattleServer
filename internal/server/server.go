@@ -11,7 +11,6 @@ import (
 
 	"github.com/luskaner/ageBattleServer/internal/logger"
 	"github.com/luskaner/ageBattleServer/internal/metrics"
-	"github.com/luskaner/ageBattleServer/internal/replay"
 	"github.com/luskaner/ageBattleServer/internal/session"
 )
 
@@ -29,13 +28,6 @@ type Config struct {
 	PublicPort          uint
 	SSLCert             string
 	SSLKey              string
-	UploadVia           string
-	ReplayHost          string
-	ReplayPort          uint
-	Login               string
-	Password            string
-	ReplayDBName        string
-	OdbcDriver          string
 	Region              string
 	// ObserverMax is the maximum number of observers per session. It is enforced in
 	// the StartObserveRequest handler (see Session.StartObserve): the observer is
@@ -166,7 +158,6 @@ type Server struct {
 	lobbyClient      *LobbyClient
 
 	sessionManager   *session.Manager
-	replayUploader   *replay.UploadManager
 	metricsCollector *metrics.Collector
 
 	clients []ClientConn
@@ -250,11 +241,6 @@ func New(cfg *Config) (*Server, error) {
 		logger.Info("Server", "New", "lobby enabled, connecting to %s:%d", cfg.LobbyHost, cfg.LobbyPort)
 	}
 
-	if cfg.UploadVia == "lobby" && cfg.ReplayHost != "" && cfg.ReplayPort > 0 {
-		s.replayUploader = replay.NewReplayUploadManager(cfg.ReplayHost, cfg.ReplayPort, cfg.UploadVia)
-		logger.Info("Server", "New", "replay upload enabled via lobby to %s:%d", cfg.ReplayHost, cfg.ReplayPort)
-	}
-
 	if cfg.PublicIP != "" {
 		logger.Info("Server", "New", "publicIP=%s (informational only, not used by the protocol)", cfg.PublicIP)
 	}
@@ -332,10 +318,6 @@ func (s *Server) Start(ctx context.Context) error {
 		}
 	}
 
-	if s.replayUploader != nil {
-		_ = s.replayUploader.Start(ctx)
-	}
-
 	if s.muninTicker != nil {
 		go s.muninLoop(ctx)
 	}
@@ -364,9 +346,6 @@ func (s *Server) Stop() error {
 	}
 	if s.lobbyClient != nil {
 		s.lobbyClient.Stop()
-	}
-	if s.replayUploader != nil {
-		s.replayUploader.Stop()
 	}
 	if s.muninTicker != nil {
 		s.muninTicker.Stop()
@@ -566,10 +545,6 @@ func (s *Server) Config() *Config {
 
 func (s *Server) SessionManager() *session.Manager {
 	return s.sessionManager
-}
-
-func (s *Server) ReplayUploader() *replay.UploadManager {
-	return s.replayUploader
 }
 
 func (s *Server) MetricsCollector() *metrics.Collector {

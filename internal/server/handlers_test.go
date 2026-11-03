@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/luskaner/ageBattleServer/internal/protocol"
-	"github.com/luskaner/ageBattleServer/internal/replay"
 	"github.com/luskaner/ageBattleServer/internal/session"
 )
 
@@ -345,11 +344,6 @@ func TestLobbyRelayRequestJoinCrossRelay13(t *testing.T) {
 	if len(p2.sent) != 1 || len(p1.sent) != 1 {
 		t.Errorf("retry relay must be dropped (no peer 0), sent %d/%d messages", len(p2.sent), len(p1.sent))
 	}
-}
-
-func newTestUploadManager(t *testing.T) *replay.UploadManager {
-	t.Helper()
-	return replay.NewReplayUploadManager("127.0.0.1", 1, "lobby")
 }
 
 func TestHandleProxyDataReplayCallback(t *testing.T) {
@@ -926,25 +920,6 @@ func TestHandleProxyData(t *testing.T) {
 	got := client.sent[0]
 	if len(got) < 3 || got[2] != protocol.MsgProxy || !bytes.Equal(got[3:], body) {
 		t.Errorf("expected Proxy relay of the body, got %x", got)
-	}
-}
-
-func TestHandleProxyDataWithUploader(t *testing.T) {
-	srv := createTestServer(t)
-	client := &mockMsgClient{}
-	srv.AddClient(client)
-	sess := srv.sessionManager.CreateSession()
-	p1 := sess.NewPeer(1, client)
-	srv.sessionManager.AddPeer(sess, p1)
-	srv.replayUploader = newTestUploadManager(t)
-
-	body := []byte{0x01, 0x01, 0x00, 0x01}
-	body = binary.LittleEndian.AppendUint16(body, proxyRecordSize)
-	body = append(body, make([]byte, proxyRecordSize)...)
-	srv.dispatchMessage(client, protocol.MsgProxy, body)
-
-	if len(client.sent) != 1 {
-		t.Errorf("expected 1 relayed message, got %d", len(client.sent))
 	}
 }
 
@@ -1804,17 +1779,6 @@ func TestHandleLobbyConnectSetsObserverConfig(t *testing.T) {
 	}
 	if sess.MaxObservers <= 0 {
 		t.Fatal("session created by LobbyConnect must accept observers")
-	}
-}
-
-func TestReplayUploaderAccessor(t *testing.T) {
-	srv := createTestServer(t)
-	if srv.ReplayUploader() != nil {
-		t.Error("ReplayUploader should be nil by default")
-	}
-	srv.replayUploader = newTestUploadManager(t)
-	if srv.ReplayUploader() != srv.replayUploader {
-		t.Error("ReplayUploader accessor mismatch")
 	}
 }
 

@@ -326,8 +326,8 @@ func portName(transport string) string {
 // prepareConfig copies the recorded configuration and changes only what cannot
 // be reproduced from inside a test. The listen ports belong to the run that
 // produced the capture and may well be in use now; the rest is the environment of
-// that run (its lobby, its replay host, its certificates), which the harness has
-// no way to provide, and every one of those is reported rather than done quietly.
+// that run (its lobby, its certificates), which the harness has no way to
+// provide, and every one of those is reported rather than done quietly.
 //
 // The ports are the one thing that is NOT replaced by a number the harness picks.
 // This used to ask the OS for a free port, close it and let the server bind it
@@ -370,11 +370,6 @@ func prepareConfig(cfg *server.Config) (*server.Config, []Deviation) {
 		run.LobbyPort = 0
 		change("lobbyPort", cfg.LobbyPort, 0,
 			"there is no lobby server in a test, and a connection attempt to one would only add noise")
-	}
-	if cfg.ReplayHost != "" || cfg.ReplayPort != 0 {
-		run.ReplayHost, run.ReplayPort = "", 0
-		change("replayHost/replayPort", cfg.ReplayHost+":"+fmt.Sprint(cfg.ReplayPort), "(none)",
-			"the replay host of that run is not reachable from here. The pages are still stored and served to observers, which is the part being compared")
 	}
 	if cfg.MuninLog != "" {
 		run.MuninLog = ""

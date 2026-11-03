@@ -448,8 +448,8 @@ func (s *Server) handleSetObservableParameters(client ClientConn, body []byte) {
 const proxyRecordSize = 15
 
 func (s *Server) handleProxyData(client ClientConn, data []byte) {
-	// One lookup for both the recording hook and the upload: the match this
-	// data belongs to is the sending peer's session.
+	// One lookup for the recording hook: the match this data belongs to is
+	// the sending peer's session.
 	sess := s.sessionManager.FindSessionByPeer(client)
 	var sessionID uint64
 	if sess != nil {
@@ -457,16 +457,6 @@ func (s *Server) handleProxyData(client ClientConn, data []byte) {
 	}
 	if h := s.config.ReplayDataHandler; h != nil {
 		h(sessionID, append([]byte(nil), data...))
-	}
-	if s.replayUploader != nil {
-		if sess == nil {
-			// The replay host keys pages by matchid+sequenceid. With no session
-			// there is no match to file this under, and reusing a shared id
-			// would interleave two matches' replays into one, so drop it.
-			logger.Debug("Server", "dispatch", "replay upload skipped, proxy data from a peer with no session from=%s", client.RemoteAddr())
-		} else {
-			s.replayUploader.OnProxyData(sess.ID64(), data)
-		}
 	}
 	if len(data) < 4 {
 		return

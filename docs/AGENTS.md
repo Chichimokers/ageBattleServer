@@ -89,8 +89,8 @@ both halves have to be applied:
 | `MESSAGES.md` | the table of message types, the source of the numbers |
 | `oob.md` | the out-of-band port |
 | `LOBBY-PROTOCOL.md` | the heartbeat with the lobby |
-| `replays.md` | the replay upload over HTTP POST |
-| `uploadVia-lobby.md`, `uploadVia-lobby-connection.md`, `uploadVia-lobby-state.md` | the three steps of `-uploadVia=lobby`, the only method the server accepts |
+| `replays.md` | the original's replay upload over HTTP POST (not implemented here) |
+| `uploadVia-lobby.md`, `uploadVia-lobby-connection.md`, `uploadVia-lobby-state.md` | the three steps of the original's `-uploadVia=lobby` (the flags are accepted and ignored here) |
 | `go1.27.md` | a copy of the Go 1.27 release notes. Not a project document, but §35 and §39.5 cite it |
 | `relay.md` | the presence beacon (`-relayBroadcastPort`). **Verified against `src/`: it is original behaviour**, and it now also carries what we do differently from the original |
 | `README.md` | the general index. Rewritten in English and checked against the tree; it is an index and nothing else |
@@ -101,10 +101,12 @@ Four documents were superseded. `README.md` has been rewritten and is no longer 
 cannot be touched, so the reason they were kept — "they are linked from `README.md`, which is
 the parent's work" — no longer applies, and each was decided on its own:
 
-- **Deleted, `uploadVia-mysql.md` and `uploadVia-odbc.md`.** The server **rejects** `mysql`
-  and `odbc` with `os.Exit(1)` (`internal/config/config.go:117-125`). A document describing a
-  supported method that the server refuses is worse than none. The six links that named them
-  (in the three `uploadVia-lobby*` files and `LOBBY-PROTOCOL.md`) are gone.
+- **Deleted, `uploadVia-mysql.md` and `uploadVia-odbc.md`.** At the time the server
+  **rejected** `mysql` and `odbc` with `os.Exit(1)`. A document describing a supported method
+  that the server refuses is worse than none. The six links that named them (in the three
+  `uploadVia-lobby*` files and `LOBBY-PROTOCOL.md`) are gone. **Update 2026-11-03: the replay
+  upload has been removed from this implementation entirely**, so the flags now accept any
+  value and are ignored; the history above is why the two documents are still not here.
 - **Deleted, `PROXY-CAPTURE-VALIDATION.md`.** It described a capture format that no longer
   exists (`main_log_*.csv`); the layout is `CAPTURES.md` and the validation is `internal/sim`.
   Its measurements were **not** lost with it — they are in `SESSION-JOURNAL.md:308-312` (§`_4`:
@@ -338,7 +340,8 @@ line, 41 s against 768 s. With `-v` or `-json` it is all there.
   launched with the same thing, a divergence that comes out may be of the flags and not of
   the protocol.
   `ParseFlags` reads `flag.CommandLine` and `os.Args`, which are process-wide, and calls
-  `os.Exit` on four paths (unknown flag or bad value, `-help`, and the two usage checks),
+  `os.Exit` on three paths (unknown flag or bad value, `-help`, and the usage check on
+  `-simulationPeriod` 0 together with an observer interval flag),
   and a `FlagSet` with `ContinueOnError` **contains none of them**: the exits are inside
   the function. That is why parsing is done in three steps: registration with a call with
   no arguments (which cannot exit), validation over that same `FlagSet` (which does return
@@ -347,8 +350,8 @@ line, 41 s against 768 s. With `-v` or `-json` it is all there.
 - **Only what is not ours is changed, and it is reported.** The listen ports go to free
   ports (the capture's are the ones of the proxy that made it, and no compared byte carries
   a port), the out-of-band is turned off (it is another service and no battle message goes
-  through it), the lobby and the replay host are turned off (they do not exist in a test)
-  and the certificate is discarded if the file is not here.
+  through it), the lobby is turned off (it does not exist in a test) and the certificate is
+  discarded if the file is not here.
   `maxPagesPerMatch`, `-simulationPeriod` and the rest are reproduced as they were, because
   they decide whether the observer gets in at all. Every change comes out in the report
   with its reason.

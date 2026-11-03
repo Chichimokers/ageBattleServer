@@ -119,6 +119,12 @@ against, so the difference is accepted with a reason instead of being chased.
   we already do correctly. **Only the range was in question.**
 - **Evidence**: `SESSION-JOURNAL.md §16.2`, and `§52` for the move.
 
+**Update 2026-11-03: the uploader has since been removed from this implementation.** The
+server no longer opens the replay socket at all and the flags are accepted and ignored, so
+the question above no longer applies to this tree. See
+[`INTENTIONAL-DIVERGENCES.md`](INTENTIONAL-DIVERGENCES.md) 6 ("The replay socket is never
+opened") and 7.
+
 ---
 
 ## 2. On bsPort we add a second peer and the original does not

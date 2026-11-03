@@ -40,9 +40,6 @@ func TestNewServerWithAllPorts(t *testing.T) {
 		PublicPort:           27012,
 		SSLCert:              "",
 		SSLKey:               "",
-		UploadVia:            "lobby",
-		ReplayHost:           "localhost",
-		ReplayPort:           80,
 		Region:               "eu-west",
 		ObserverMax:          256,
 		SimulationPeriod:     16.0,
@@ -71,9 +68,6 @@ func TestNewServerWithAllPorts(t *testing.T) {
 	}
 	if srv.lobbyClient == nil {
 		t.Error("lobbyClient should be created")
-	}
-	if srv.replayUploader == nil {
-		t.Error("replayUploader should be created")
 	}
 }
 

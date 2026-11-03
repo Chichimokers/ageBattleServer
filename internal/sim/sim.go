@@ -1118,7 +1118,7 @@ func wsPayload(frame []byte) []byte {
 // binary down without saying why. Three things prevent that:
 //
 //  1. It is called once with an empty command line first, on a throwaway
-//     FlagSet. That call cannot fail (no flag set, uploadVia empty, help false)
+//     FlagSet. That call cannot fail (no flag set, help false)
 //     and leaves the complete set of registered names behind, so the flags the
 //     original knows and this parser does not are found before the real call.
 //     An unknown flag is dropped and reported: our default for that knob is the
@@ -1128,11 +1128,11 @@ func wsPayload(frame []byte) []byte {
 //  3. Only then is ParseFlags called for the result, on a FlagSet with
 //     ExitOnError and arguments that are known to parse.
 //
-// The three os.Exit paths ParseFlags can still take are the help flags and the
-// two usage checks (an unsupported -uploadVia, and -simulationPeriod 0 together
-// with an observer interval flag, config.go:117-141). All three are checked
-// here, and all three mean the recorded command line never produced a running
-// server, so they are refused rather than reproduced.
+// The two os.Exit paths ParseFlags can still take are the help flags and the
+// usage check on -simulationPeriod 0 together with an observer interval flag
+// (config.go:120-142). Both are checked here, and both mean the recorded command
+// line never produced a running server, so they are refused rather than
+// reproduced.
 func ConfigFromArgs(args []string) (*server.Config, []string, error) {
 	known, boolFlags, err := knownFlagNames()
 	if err != nil {
@@ -1152,7 +1152,7 @@ func ConfigFromArgs(args []string) (*server.Config, []string, error) {
 		}
 	}
 
-	var uploadVia, simPeriod string
+	var simPeriod string
 	if err := withFlagSet(flag.ContinueOnError, clean, func() error {
 		// Registration pass: ParseFlags with nothing to parse. It only registers
 		// its flags on flag.CommandLine, and it cannot exit this way.
@@ -1167,12 +1167,12 @@ func ConfigFromArgs(args []string) (*server.Config, []string, error) {
 		if err := flag.CommandLine.Parse(clean); err != nil {
 			return err
 		}
-		uploadVia, simPeriod = flagValue("uploadvia"), flagValue("simulationperiod")
+		simPeriod = flagValue("simulationperiod")
 		return nil
 	}); err != nil {
 		return nil, dropped, fmt.Errorf("the recorded command line %q does not parse: %w", strings.Join(args, " "), err)
 	}
-	if err := checkUsageExits(uploadVia, simPeriod, clean); err != nil {
+	if err := checkUsageExits(simPeriod, clean); err != nil {
 		return nil, dropped, err
 	}
 
@@ -1328,13 +1328,10 @@ func flagValue(name string) string {
 	return fmt.Sprint(g.Get())
 }
 
-// checkUsageExits refuses the two usage checks inside ParseFlags, which exit(1)
-// instead of starting a server. A capture whose command line trips one of them
-// describes a process that never ran, so there is nothing to compare against.
-func checkUsageExits(uploadVia, simPeriod string, args []string) error {
-	if uploadVia != "" && uploadVia != "lobby" {
-		return fmt.Errorf("the recorded command line asks for -uploadVia %s, which only 'lobby' supports: the server would have exited, so this capture is not from a real run", uploadVia)
-	}
+// checkUsageExits refuses the usage check inside ParseFlags, which exits(1)
+// instead of starting a server. A capture whose command line trips it describes
+// a process that never ran, so there is nothing to compare against.
+func checkUsageExits(simPeriod string, args []string) error {
 	observerFlag := false
 	for i := 0; i < len(args); i++ {
 		name, _, _, next := splitArg(args, i)

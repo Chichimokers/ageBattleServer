@@ -125,9 +125,6 @@ func TestParseFlagsDefaults(t *testing.T) {
 	if cfg.SimulationPeriod != 0 {
 		t.Errorf("SimulationPeriod = %v, want 0", cfg.SimulationPeriod)
 	}
-	if cfg.UploadVia != "" {
-		t.Errorf("UploadVia = %q, want empty", cfg.UploadVia)
-	}
 }
 
 func TestParseFlagsValues(t *testing.T) {
@@ -206,24 +203,8 @@ func TestParseFlagsValues(t *testing.T) {
 	if cfg.SSLKey != "/tmp/key.pem" {
 		t.Errorf("SSLKey = %q, want /tmp/key.pem", cfg.SSLKey)
 	}
-	if cfg.UploadVia != "lobby" {
-		t.Errorf("UploadVia = %q, want lobby", cfg.UploadVia)
-	}
-	if cfg.ReplayHost != "replay.example.com" {
-		t.Errorf("ReplayHost = %q, want replay.example.com", cfg.ReplayHost)
-	}
-	if cfg.ReplayPort != 7777 {
-		t.Errorf("ReplayPort = %d, want 7777", cfg.ReplayPort)
-	}
-	if cfg.Login != "user" || cfg.Password != "pass" {
-		t.Errorf("Login/Password = %q/%q, want user/pass", cfg.Login, cfg.Password)
-	}
-	if cfg.ReplayDBName != "db1" {
-		t.Errorf("ReplayDBName = %q, want db1", cfg.ReplayDBName)
-	}
-	if cfg.OdbcDriver != "driver1" {
-		t.Errorf("OdbcDriver = %q, want driver1", cfg.OdbcDriver)
-	}
+	// The replay flags are parsed and deliberately discarded: the original's
+	// arguments stay accepted, but there is no upload to configure.
 	if cfg.Region != "eu" {
 		t.Errorf("Region = %q, want eu", cfg.Region)
 	}
@@ -280,6 +261,23 @@ func TestParseFlagsValues(t *testing.T) {
 	}
 }
 
+// TestParseFlagsAcceptsAnyUploadVia: the upload is gone, so -uploadVia has no
+// value left to validate. Any value must parse, because a launcher that passes
+// the original's own "mysql" or "odbc" must not be refused by a flag that does
+// nothing.
+func TestParseFlagsAcceptsAnyUploadVia(t *testing.T) {
+	for _, value := range []string{"lobby", "mysql", "odbc", "bogus"} {
+		t.Run(value, func(t *testing.T) {
+			resetFlags()
+			os.Args = []string{"battleserver", "-uploadvia", value}
+			cfg := ParseFlags()
+			if cfg.Name != "My Server" {
+				t.Errorf("Name = %q, want the default: the rest of the config must be unaffected", cfg.Name)
+			}
+		})
+	}
+}
+
 func TestParseFlagsRelayBroadcastDisabled(t *testing.T) {
 	resetFlags()
 	os.Args = []string{"battleserver", "-relaybroadcastport", "0"}
@@ -315,7 +313,14 @@ func TestPrintUsage(t *testing.T) {
 	_ = r.Close()
 	out := string(buf[:n])
 
-	for _, want := range []string{"Usage: battleserver", "Network Options:", "Session Options:", "Logging Options:", "-help, -h, -?"} {
+	for _, want := range []string{
+		"Usage: battleserver", "Network Options:", "Session Options:",
+		"Logging Options:", "-help, -h, -?",
+		// The original's replay arguments stay listed, even though the upload
+		// is gone: a launcher reads the help to decide what it may pass.
+		"-uploadVia", "-replayHost", "-replayPort", "-login", "-password",
+		"-replayDBName", "-odbcDriver", "accepted and ignored",
+	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("usage output missing %q", want)
 		}

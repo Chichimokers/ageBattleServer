@@ -19,6 +19,18 @@ var (
 	LogModLevel string
 )
 
+// legacyReplayArgs holds the values of the original's replay-upload flags.
+// They are parsed and then discarded: this server does not upload replays.
+type legacyReplayArgs struct {
+	uploadVia    string
+	replayHost   string
+	replayPort   uint
+	login        string
+	password     string
+	replayDBName string
+	odbcDriver   string
+}
+
 func ParseFlags() *server.Config {
 	cfg := &server.Config{}
 
@@ -36,13 +48,19 @@ func ParseFlags() *server.Config {
 	flag.UintVar(&cfg.PublicPort, "publicport", uint(publicPort), "Public port")
 	flag.StringVar(&cfg.SSLCert, "sslcert", "", "SSL certificate path")
 	flag.StringVar(&cfg.SSLKey, "sslkey", "", "SSL private key path")
-	flag.StringVar(&cfg.UploadVia, "uploadvia", "", "Upload method: lobby")
-	flag.StringVar(&cfg.ReplayHost, "replayhost", "", "Host for replay upload")
-	flag.UintVar(&cfg.ReplayPort, "replayport", 0, "Port for replay upload")
-	flag.StringVar(&cfg.Login, "login", "", "DB user (mysql/odbc)")
-	flag.StringVar(&cfg.Password, "password", "", "DB password (mysql/odbc)")
-	flag.StringVar(&cfg.ReplayDBName, "replaydbname", "ww_1_relayhistory", "DB name")
-	flag.StringVar(&cfg.OdbcDriver, "odbcdriver", "MysqlTest", "ODBC driver")
+	// The replay upload is not implemented. These seven flags are the
+	// original BattleServer.exe's own arguments: they stay registered, with
+	// their names, types and defaults, so a launcher written for the original
+	// still starts instead of exiting 2 on an unknown flag. Nothing reads their
+	// values, so they bind to throwaway locals rather than Config fields.
+	var legacyReplay legacyReplayArgs
+	flag.StringVar(&legacyReplay.uploadVia, "uploadvia", "", "Upload method (accepted; upload not implemented)")
+	flag.StringVar(&legacyReplay.replayHost, "replayhost", "", "Host for replay upload (accepted; upload not implemented)")
+	flag.UintVar(&legacyReplay.replayPort, "replayport", 0, "Port for replay upload (accepted; upload not implemented)")
+	flag.StringVar(&legacyReplay.login, "login", "", "DB user for mysql/odbc (accepted; upload not implemented)")
+	flag.StringVar(&legacyReplay.password, "password", "", "DB password for mysql/odbc (accepted; upload not implemented)")
+	flag.StringVar(&legacyReplay.replayDBName, "replaydbname", "ww_1_relayhistory", "DB name (accepted; upload not implemented)")
+	flag.StringVar(&legacyReplay.odbcDriver, "odbcdriver", "MysqlTest", "ODBC driver (accepted; upload not implemented)")
 	flag.StringVar(&cfg.Region, "region", "global", "Server region")
 	flag.UintVar(&cfg.ObserverMax, "observermax", 512, "Max concurrent observers")
 	flag.UintVar(&cfg.ObserverUpdateIntervalMS, "observerupdateintervalms", 8, "Observer update interval (ms)")
@@ -113,14 +131,20 @@ func ParseFlags() *server.Config {
 		logger.Warning("Main", "parseFlags", "serverLog, logFileCount and logFileSize are deprecated and ignored")
 	}
 
-	switch cfg.UploadVia {
-	case "", "lobby":
-	case "mysql", "odbc":
-		logger.Error("Main", "parseFlags", "uploadVia=%s not supported, only 'lobby' is available", cfg.UploadVia)
-		os.Exit(1)
-	default:
-		logger.Error("Main", "parseFlags", "invalid uploadVia=%s, only 'lobby' is supported", cfg.UploadVia)
-		os.Exit(1)
+	// Any value of -uploadVia is accepted: the upload is gone, so there is no
+	// method to validate. One notice, only when one of the original's replay
+	// flags was actually given, so a launcher that always passes them is not
+	// warned on every start.
+	replayFlagSet := false
+	flag.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "uploadvia", "replayhost", "replayport", "login", "password",
+			"replaydbname", "odbcdriver":
+			replayFlagSet = true
+		}
+	})
+	if replayFlagSet {
+		logger.Info("Main", "parseFlags", "the replay upload is not implemented; -uploadVia, -replayHost, -replayPort, -login, -password, -replayDBName and -odbcDriver are accepted and ignored")
 	}
 
 	var observerUpdateIntervalSet, observerSocketSkipSet, simulationPeriodSet bool
@@ -171,13 +195,14 @@ func printUsage() {
 	fmt.Println("  -sslKey string                   SSL private key path")
 	fmt.Println()
 	fmt.Println("Replay Options:")
-	fmt.Println("  -uploadVia string                Upload method (only 'lobby')")
-	fmt.Println("  -replayHost string                Host for replay upload")
-	fmt.Println("  -replayPort uint                 Port for replay upload")
-	fmt.Println("  -login string                    DB user (mysql/odbc)")
-	fmt.Println("  -password string                 DB password (mysql/odbc)")
-	fmt.Println("  -replayDBName string             DB name (default \"ww_1_relayhistory\")")
-	fmt.Println("  -odbcDriver string               ODBC driver (default \"MysqlTest\")")
+	fmt.Println("  (the replay upload is not implemented; these flags are accepted and ignored)")
+	fmt.Println("  -uploadVia string                Upload method (accepted; upload not implemented)")
+	fmt.Println("  -replayHost string                Host for replay upload (accepted; upload not implemented)")
+	fmt.Println("  -replayPort uint                 Port for replay upload (accepted; upload not implemented)")
+	fmt.Println("  -login string                    DB user for mysql/odbc (accepted; upload not implemented)")
+	fmt.Println("  -password string                 DB password for mysql/odbc (accepted; upload not implemented)")
+	fmt.Println("  -replayDBName string             DB name (default \"ww_1_relayhistory\"; accepted; upload not implemented)")
+	fmt.Println("  -odbcDriver string               ODBC driver (default \"MysqlTest\"; accepted; upload not implemented)")
 	fmt.Println()
 	fmt.Println("Session Options:")
 	fmt.Println("  -observerMax uint                Max observers (default 512)")

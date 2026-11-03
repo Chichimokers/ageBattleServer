@@ -14,4 +14,3 @@
 ## Age Server related
 
 * Allow to be embedded as a library in the Server simplifying operations.
-* Enable replay uploading.
