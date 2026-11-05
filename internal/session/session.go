@@ -1514,6 +1514,13 @@ func (s *Session) closeExpiredPeers() {
 // not walked a second time for it. A Tick with no PopAckTick before it (a test, or
 // a tick whose ack was suppressed because the game ended) falls back to its own
 // walk, which is the same answer.
+//
+// The one difference from the live walk it replaced: PopAckTick's walk runs
+// BEFORE the drain, so a peer whose queue empties in this tick's drain is still
+// seen holding data here and is reaped on the next tick instead of this one, one
+// tick (125 ms) later. The original computes the answer before its drain too, so
+// this is the faithful order; TestSessionSyncTimeoutReapsOneTickAfterTheQueueEmpties
+// pins it.
 func (s *Session) closeSyncTimedOutPeers() {
 	now := time.Now()
 	ids, fresh := s.takeTickTimedOut()
