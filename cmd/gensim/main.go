@@ -263,6 +263,12 @@ import (
 )
 
 func TestSim_%s(t *testing.T) {
+	// The replays are independent: each one starts its own server on OS-assigned
+	// ports and reads its own capture, so they run concurrently and the suite's
+	// critical path is the longest capture instead of the sum of them. The flag
+	// parsing they share is serialized in internal/sim (withFlagSet), because
+	// flag.CommandLine and os.Args are process-wide.
+	t.Parallel()
 	sim.Run(t, %q)
 }
 `, name, ident(name), filepath.ToSlash(filepath.Join(testDataDirName, name)))
