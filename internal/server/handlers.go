@@ -860,10 +860,11 @@ func (s *Server) handleLobbyChecksumAck(client messageClient, body []byte, depth
 	slot := sess.PeerIDForConn(client)
 	if slot != 0 && sess.GetPeer(slot) != nil {
 		// There is one vector per peer, and the vectors are reconciled across
-		// peers on the tick.
-		entries := make([]byte, 8*n)
-		copy(entries, body[1:off])
-		sess.QueueChecksumEntries(slot, entries)
+		// peers on the tick. The entries are handed over as a window on the
+		// message: QueueEntries copies them into the peer's own buffer under its
+		// lock and retains nothing, so the copy this used to make first was a
+		// second copy of the same bytes on every checksum message.
+		sess.QueueChecksumEntries(slot, body[1:off])
 	}
 	if off < len(body) {
 		s.dispatch(client, body[off], body[off+1:], depth+1)

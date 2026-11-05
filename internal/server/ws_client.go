@@ -30,9 +30,13 @@ type WsClient struct {
 	clientMessageVersion uint16
 	observerSkip         uint32
 	skipMS               uint32
-	pinged               bool
-	closed               bool
-	observer             bool
+	// pinged is set by the first replay-data upload and read on every upload, and
+	// observer is read on every dispatch and every upload. Both are atomics rather
+	// than fields behind mu: they were two lock acquisitions per message on the
+	// busiest path in a real match.
+	pinged   atomic.Bool
+	observer atomic.Bool
+	closed   bool
 	// dispatchMu serializes Process and Close. A Close that arrives while a
 	// handler is being dispatched cannot take it (the handler may be the one
 	// asking for the close, as StopObserve is), so it sets closePending and
@@ -218,7 +222,7 @@ func (c *WsClient) Process(maxPackets int, now time.Time) {
 	// gates only idle clients: pending data is processed immediately, so under
 	// event-driven processing (P1) the skip only affects the coarse safety-net
 	// polling.
-	if c.observer && c.skipMS > 0 && len(c.incoming) == 0 {
+	if c.observer.Load() && c.skipMS > 0 && len(c.incoming) == 0 {
 		c.observerSkip++
 		if c.observerSkip < c.skipMS {
 			c.mu.Unlock()
@@ -339,17 +343,13 @@ func (c *WsClient) enqueue(data []byte) {
 }
 
 func (c *WsClient) SetObserver(v bool) {
+	c.observer.Store(v)
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.observer = v
 	c.observerSkip = 0
+	c.mu.Unlock()
 }
 
-func (c *WsClient) IsObserver() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.observer
-}
+func (c *WsClient) IsObserver() bool { return c.observer.Load() }
 
 // SetPeerIdentifier stores the connection's observer identity. Every connection
 // starts at 0 and the StartObserve request overwrites it; on this transport it is
@@ -382,17 +382,9 @@ func (c *WsClient) touch() {
 	c.mu.Unlock()
 }
 
-func (c *WsClient) pingStarted() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.pinged
-}
+func (c *WsClient) pingStarted() bool { return c.pinged.Load() }
 
-func (c *WsClient) setPingStarted() {
-	c.mu.Lock()
-	c.pinged = true
-	c.mu.Unlock()
-}
+func (c *WsClient) setPingStarted() { c.pinged.Store(true) }
 
 func (c *WsClient) lobbyPingTick(now time.Time, counter uint32) {
 	c.mu.Lock()
