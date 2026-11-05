@@ -16,7 +16,6 @@ any game publisher. Product names are used only to describe interoperability.
 - Optional out-of-band WebSocket endpoint
 - Optional LAN presence broadcasts over UDP
 - Session and observer management
-- Optional replay data callback for embedding hosts
 - Configurable logging and resource limits
 
 ## Requirements
