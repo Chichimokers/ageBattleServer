@@ -898,11 +898,43 @@ the private share of the mapped DLLs.
   packages** to our `init()` functions, so it is not ours either — it is the runtime's and
   the loader's.
 
-**The one term Go offers no lever for is the 32,55 MB**, and it is 3× the size of the binary
-that carries it, so it is not file-backed content: it is the writable image sections, dirtied
-by the loader and by startup, whose size does not follow the file. It is also the term a port
-would remove, which is what makes the footprint case for one a case about **the runtime** and
-not about the server.
+**The one term Go offers no lever for is the 32,55 MB, and it has an address.** It is 3× the
+size of the binary that carries it, so it is not file-backed content, and it is not "the
+writable image sections, dirtied by the loader and by startup" in general: it is **one
+symbol**. `go tool nm -size` on this tree, sorted by size, puts it first by two orders of
+magnitude:
+
+```text
+140766d40   33554432 B crypto/internal/fips140/drbg.memory
+140390f00    2192368 R runtime.pclntab
+14061ce68     658704 R type:*
+```
+
+`crypto/internal/fips140/drbg.memory` is a **32 MiB `ScratchBuffer`** for Go's CPU-jitter
+entropy source (`crypto/internal/entropy/v1.0.0`: `type ScratchBuffer [1 << 25]byte`). It is
+linked whenever `crypto/tls` is linked, which this server always does: the out-of-band port is
+WebSocket-over-TLS and the WebSocket port may be TLS. On ELF the buffer is lazily backed; **on
+Windows the PE loader commits the whole `.data` virtual size**, and the `.data` section is
+**32,66 MB of virtual size against 0,32 MB of raw size**. The 32,5 MB is that zero-fill, and
+`vadbreak` attributes it exactly: `MEM_IMAGE READWRITE 32,53 MB` over 16 regions, which is the
+row in the table above.
+
+**It is not resident.** The working set `benchpeer` measures is **11,9 MB**, so this is a
+commit-charge figure and not a RAM figure, and the working set is a tie with the original
+(11,9 against 10,1 MB). That distinction is the whole of the entry: an operator watching
+working set sees a tie, and one watching commit charge sees 5,3×.
+
+**What does not remove it, measured or checked:** `-ldflags="-s -w"` (46,71 → 46,31 MB),
+`GOGC`/`GOMEMLIMIT` (no effect, above), `-buildmode=pie` (the symbol is still present),
+`GOFIPS140=off` (already the default, and the buffer is still linked), and Go 1.26.5 (the same
+32 MiB symbol). Go 1.25.5 does not have it — its `.data` virtual size is **0,48 MB** and
+`go tool nm` finds no `drbg.memory` — but pinning 1.25 would drop the Go 1.27 features this
+tree uses, so it is not proposed. A `notls` build variant would remove it and would also
+remove WebSocket TLS and the out-of-band port; that is a **feature** decision with its own
+release note, not a performance one, and it is not taken here.
+
+It is also the term a port would remove, which is what makes the footprint case for one a case
+about **the runtime** and not about the server.
 
 
 **2. Idle working set is nearly a tie: 11,9 MB against 10,1 MB.** The gap is 1,8 MB and it is
@@ -932,10 +964,11 @@ complained about it. It is in this file because it is a figure, not because it i
 - **It is not a comparison of algorithmic efficiency.** It is a comparison of what the two
   **processes** cost, which includes each language runtime's idle footprint and garbage
   collector headroom. Ours is 5,3× on commit, and the decomposition above says where that
-  is: **32,55 MB of dirty executable pages** and an **11,7 MB Go runtime floor**, against our
-  own **2,35 MB** of data. That is a runtime property and not a defect in the server, and no
-  amount of work in `internal/session` would change it — which is also why the collector
-  settings do not, and why they were tried before the claim was rewritten.
+  is: **32,55 MB of dirty executable pages, which is one 32 MiB entropy buffer the Windows
+  loader commits**, and an **11,7 MB Go runtime floor**, against our own **2,35 MB** of data.
+  That is a runtime property and not a defect in the server, and no amount of work in
+  `internal/session` would change it — which is also why the collector settings do not, and
+  why they were tried before the claim was rewritten.
 - **The handshake row used to say "not comparable" and that was wrong. It is now measured,
   and it is a divergence.** It said "the original is bimodal… a first-connection cold path
   **on our side** is the obvious candidate and it was **not isolated**". Isolated on
