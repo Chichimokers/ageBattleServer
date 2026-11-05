@@ -1,9 +1,18 @@
-# Records the peak working set of every Go test binary while the suite runs, so
-# the 500 MB ceiling in the plan's definition of done is a measurement and not an
-# assumption. It samples every 500 ms and prints the maximum at the end.
+# Records the peak memory of the Go test binaries while the suite runs, so the
+# 500 MB ceiling in the plan's definition of done is a measurement and not an
+# assumption.
 #
-# PeakWorkingSet64 is the process's own high-water mark, so a 500 ms sample cannot
-# miss a spike between two samples: the figure is the peak, not the last reading.
+# The figure is the SUM of the working sets of every test binary alive at the same
+# moment, and the peak of that sum. That is the methodology PERFORMANCE.md 2 uses
+# and it is the only one that answers the question: `go test ./...` runs one binary
+# per package, several of them at once, so the machine's cost is the sum and not
+# the largest single process. A maximum over processes would report the biggest
+# package and call it the suite.
+#
+# WorkingSet64 is the current working set, sampled every 500 ms; the peak of the
+# sum is what is reported. A spike shorter than the interval can be missed, which
+# is why the interval is short and why the figure is reported as a floor rather
+# than as an exact maximum.
 #
 # IT IS NOT FREE. Enumerating every process on the machine twice a second is
 # measurable load, and it was enough to flip one verdict: a full run with this
@@ -14,21 +23,34 @@
 param([int]$Minutes = 30)
 
 $deadline = (Get-Date).AddMinutes($Minutes)
-$peak = 0
-$peakName = ''
+$peakSum = 0
+$peakSumAt = ''
+$peakSingle = 0
+$peakSingleName = ''
 while ((Get-Date) -lt $deadline) {
-    foreach ($p in (Get-Process -ErrorAction SilentlyContinue)) {
-        if ($p.ProcessName -notlike '*test*') { continue }
+    $sum = 0
+    $names = @()
+    # -Name with a wildcard, and not a filter over every process: the OS does the
+    # matching, which is what keeps this sampler cheap enough to run beside a suite
+    # whose verdicts depend on a 125 ms tick.
+    foreach ($p in (Get-Process -Name '*test*' -ErrorAction SilentlyContinue)) {
         try {
-            $ws = $p.PeakWorkingSet64
+            $ws = $p.WorkingSet64
         } catch {
             continue
         }
-        if ($ws -gt $peak) {
-            $peak = $ws
-            $peakName = $p.ProcessName
+        $sum += $ws
+        $names += $p.ProcessName
+        if ($ws -gt $peakSingle) {
+            $peakSingle = $ws
+            $peakSingleName = $p.ProcessName
         }
+    }
+    if ($sum -gt $peakSum) {
+        $peakSum = $sum
+        $peakSumAt = ($names | Sort-Object -Unique) -join ', '
     }
     Start-Sleep -Milliseconds 500
 }
-'peak working set: {0:N1} MB ({1})' -f ($peak / 1MB), $peakName
+'peak sum of test binaries : {0:N1} MB ({1})' -f ($peakSum / 1MB), $peakSumAt
+'peak single test binary   : {0:N1} MB ({1})' -f ($peakSingle / 1MB), $peakSingleName
