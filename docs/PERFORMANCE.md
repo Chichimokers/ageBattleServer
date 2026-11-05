@@ -77,6 +77,33 @@ of the same tree are within 0,4 % of each other, which is what "load-independent
 **The short loop's clock is the one that is not comparable**, for the same reason as always:
 it is CPU-bound.
 
+### The suite after W7 (2026-11-05), and what changed it
+
+The 775,6 s above is the figure **before** the replays were made concurrent. `internal/sim`'s
+generated `sim_*_test.go` body now calls `t.Parallel()`, so the five real captures and the two
+synthetic fixtures replay at the same time instead of one after another, and `settleFor` no
+longer waits for the observer step's period on a capture that has no observer to serve.
+
+| | before W7 | after W7 |
+|---|---|---|
+| `go test ./... -count=1 -timeout 25m` | 775,6 s | **~400 s wall clock** |
+| `internal/sim` | 770,809 s | **338,4 / 338,6 s** over two runs |
+| `go test -short ./... -count=1` | ~49 s | ~49 s (unchanged: the long captures are skipped) |
+| peak working set of a test binary | 116,0 MB | **not re-sampled this round**; the 45's 116,0 MB stands, and `TestLongMatchMemoryAndCostAreBounded` asserts the long match's own bound |
+
+The critical path is now the longest single capture instead of the sum of them, which is what
+the plan predicted (~350-400 s). The two `internal/sim` figures are within 0,06 % of each
+other, so the concurrent replays are as load-independent as the serial ones were.
+
+**The one flake, and what it was.** A run with an extra sampler polling every process on the
+machine every 500 ms failed `TestSyntheticCaptureMatchesOriginal` with a `[body-mismatch]` on
+the first `0x0A`: our replay grouped all three of the fixture's pages into one ack where the
+original's first tick caught one. That fixture is a **one-second** capture, so its ack
+grouping is decided by whether the tick lands between two pages, and the extra load moved it.
+Without the sampler the same tree passed three consecutive full runs. The lesson is the one
+this section already states: a clock figure needs its load beside it, and so does a verdict
+that depends on a 125 ms tick.
+
 ### The load of the 44, measured, and why one of the two rows is not comparable
 
 Eight samples of `Win32_Processor.LoadPercentage` taken while this shell did nothing but ask
