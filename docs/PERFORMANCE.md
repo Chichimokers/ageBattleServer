@@ -20,9 +20,10 @@
 > machine down is a broken test even if it passes. Nothing generates synthetic data without an explicit cap in
 > the code, and no O(n²)-memory algorithms over real captures.
 >
-> **The suite is currently over the budget** (778,5 s against 600 s) and **section 9** is
-> the write-up of the ways out, with their measured figures. **None of them has been taken**:
-> which tests execute is the user's decision, not this file's.
+> **The suite was over the budget** (778,5 s against 600 s) and **section 9** is the
+> write-up of the ways out, with their measured figures. **Option 1 has since been taken**:
+> the capture replays now run concurrently and the suite is **~400 s**, inside the budget.
+> Section 1 records the measurement and section 9 says which option it was.
 
 ---
 
@@ -87,20 +88,32 @@ longer waits for the observer step's period on a capture that has no observer to
 | | before W7 | after W7 |
 |---|---|---|
 | `go test ./... -count=1 -timeout 25m` | 775,6 s | **~400 s wall clock** |
-| `internal/sim` | 770,809 s | **338,4 / 338,6 s** over two runs |
+| `internal/sim` | 770,809 s | **338,4 / 338,6 / 339,2 s** over three runs |
 | `go test -short ./... -count=1` | ~49 s | ~49 s (unchanged: the long captures are skipped) |
-| peak working set of a test binary | 116,0 MB | **not re-sampled this round**; the 45's 116,0 MB stands, and `TestLongMatchMemoryAndCostAreBounded` asserts the long match's own bound |
+| peak working set of the test binaries, summed | 116,0 MB (one binary) | **159,9 MB** summed, **70,9 MB** the largest single one (`sim.test`); see below |
 
 The critical path is now the longest single capture instead of the sum of them, which is what
-the plan predicted (~350-400 s). The two `internal/sim` figures are within 0,06 % of each
+the plan predicted (~350-400 s). The three `internal/sim` figures are within 0,24 % of each
 other, so the concurrent replays are as load-independent as the serial ones were.
+
+**The RAM ceiling, measured.** `scripts/suite-ram.ps1` samples the **sum** of the working sets
+of every `*test*` process every 500 ms while the suite runs, which is the methodology of
+section 2, and reports the peak of that sum and the peak of any single binary. Over a full
+green run: **peak sum 159,9 MB**, at a moment when `battleserver.test`, `proxy.test`,
+`server.test` and `session.test` were alive together; **peak single 70,9 MB**, `sim.test`.
+The two peaks did not coincide — `sim.test` runs for 337 s on its own while the other
+packages finish in the first 40 — so the worst case is bounded by their sum, **230,8 MB**,
+which is still under half of the **500 MB** of the definition of done. The figure is a
+**floor** and not an exact maximum: a spike shorter than the 500 ms interval can be missed.
 
 **The one flake, and what it was.** A run with an extra sampler polling every process on the
 machine every 500 ms failed `TestSyntheticCaptureMatchesOriginal` with a `[body-mismatch]` on
 the first `0x0A`: our replay grouped all three of the fixture's pages into one ack where the
 original's first tick caught one. That fixture is a **one-second** capture, so its ack
 grouping is decided by whether the tick lands between two pages, and the extra load moved it.
-Without the sampler the same tree passed three consecutive full runs. The lesson is the one
+Without the sampler the same tree passed three consecutive full runs, and the RAM run above —
+which had the sampler alongside it — passed too, so the flake is load-dependent and not
+deterministic. The lesson is the one
 this section already states: a clock figure needs its load beside it, and so does a verdict
 that depends on a 125 ms tick.
 
@@ -188,6 +201,10 @@ readings, repeated 3 times and keeping the fastest window: machine load only add
 time. The two counters (allocations and bytes) come from `MemStats` and are
 exact.
 
+**The table below is the measurement of 2026-10-04, before W1a and W1b.** It is kept
+because it is the "before" of the change that removed the per-tick allocations; the
+current figures are the second table.
+
 | peers | blocks | ns/tick | allocs/tick | allocs/peer | B/tick |
 |---|---|---|---|---|---|
 | 1 | 8 | 1,066 | 4.00 | 4.00 | 422 |
@@ -197,27 +214,48 @@ exact.
 | 16 | 16 | 8,466 | 6.02 | 0.38 | 5,534 |
 | 32 | 32 | 15,931 | 6.05 | 0.19 | 11,015 |
 
+**After W1a and W1b (2026-11-05, this tree, same fixture and same windows):**
+
+| peers | blocks | ns/tick | allocs/tick | allocs/peer | B/tick |
+|---|---|---|---|---|---|
+| 1 | 8 | 811 | **0.00** | 0.00 | **0** |
+| 2 | 8 | 1,022 | **0.00** | 0.00 | **0** |
+| 4 | 8 | 1,703 | **0.00** | 0.00 | **0** |
+| 8 | 8 | 3,019 | **0.00** | 0.00 | **0** |
+| 16 | 16 | 5,219 | **0.00** | 0.00 | **0** |
+| 32 | 32 | 11,095 | **0.00** | 0.00 | **0** |
+
+The 32-peer point measured **10,783 ns** on the run before this one, so the two are
+within 3 % of each other and the clock is the only thing that moved between them. The
+allocations are **zero at every peer count**, which is the point of the change: the ack
+body is built inside the frame store's open block, the queue-record snapshot is the
+session's own scratch, and the store recycles a dropped block's buffer instead of
+allocating the next one.
+
 The blocks come from the binary's formula in section 5, not from a choice of the
 test.
 
 - **pending time** over the points at or above the 8-peer floor:
-  **492 ns/peer** (0.49 us), against the 30,000 ns cap the test itself sets.
-- **pending allocations**: **0.00 objects/peer/tick**, against the 3.0 cap (0.50 with
-  `-race`, which is its own shadow). The fixed part of a tick is **4 objects** and **does not grow**
-  with the peers.
-- With `-race` the same tick at 32 peers measures 585 us, that is **about thirteen times more**. That is why
+  **341 ns/peer** (0.34 us), against the 30,000 ns cap the test itself sets. It was
+  492 ns/peer.
+- **pending allocations**: **0.00 objects/peer/tick**, against the 2.0 cap (0.50 with
+  `-race`, which is its own shadow). The fixed part of a tick is **0 objects** and
+  **does not grow** with the peers. It was 4.
+- With `-race` the same tick at 32 peers measures **307 us**, that is **about
+  twenty-eight times more**. That is why
   the clock caps of that file (2 ms per tick, 30 us per peer) are **order-of-magnitude** caps
   and say so: the sharp assertion of the file is **the count**, which is a
   counter and not a clock.
 
 ### The extrapolation, with the arithmetic shown
 
-Measured at 4 peers: 2,470 ns/tick. Ticks of a 2 h match at 8 ticks/s =
-`2 x 3600 x 8 = 57,600`. CPU = `57,600 x 2,470 ns = 0.142 s` **for the whole match**.
-Measured at 8 peers: 4,026 ns/tick -> `0.232 s`.
+Measured at 4 peers: 1,703 ns/tick. Ticks of a 2 h match at 8 ticks/s =
+`2 x 3600 x 8 = 57,600`. CPU = `57,600 x 1,703 ns = 0.098 s` **for the whole match**.
+Measured at 8 peers: 3,019 ns/tick -> `0.174 s`.
 
-That is, **a two-hour match costs between 0.14 and 0.23 seconds of CPU**, with a tick
-every 125 ms. The calculation is a tautology (it is the per-tick times the number of ticks) and
+That is, **a two-hour match costs between 0.10 and 0.17 seconds of CPU**, with a tick
+every 125 ms. (Before W1a and W1b the same arithmetic gave 0.14 and 0.23 s.) The
+calculation is a tautology (it is the per-tick times the number of ticks) and
 so what matters is **where the per-tick comes from**.
 
 **What is measured and what is extrapolated.** Measured: the whole table, the slopes, the live heap
@@ -439,6 +477,15 @@ measurement adds is that **the allocations and the bytes per tick did not move**
 representation changes (4.00 objects at one peer and 6.05 at 32, 422 B and 11,016 B), so the
 table still holds as a number.
 
+**It no longer holds after W1a and W1b, and that is the point of them.** The four sites
+above are gone from the profile: `PopTick` builds the ack inside the frame store's open
+block, `queueEntries` appends into the session's own scratch, `AddFrame` writes into the
+block `Reserve` handed out, and the `sort.SliceStable` is gone because the queue is
+already in peer-add order, which is the order the ack lists. The measured rate is
+**0.00 objects and 0 B per tick at every peer count**
+(section 3), so there is no short-lived heap left to rank. The table is kept as the
+"before" of that change.
+
 ### Where the long-lived is
 
 `inuse_space` after two collections, the store full and the fixture alive:
@@ -466,8 +513,8 @@ The seven caps that hold that test down, with the margin that chose them:
 | heap growth | 4 MiB | 21 KiB | 190x | any leak that reserves something per tick (4 MiB / 57,600 = 72 B) |
 | curve slope | 8 B/tick | 0.30 B/tick | 26x | a one-slice-header-per-tick leak (48 B) already fails it |
 | absolute heap ceiling | 32 MiB | 820 KiB | 40x | a leak that is already in the baseline |
-| allocations per tick | 24 (after the 38) | 6.01 | 4x | a new path that reserves per tick |
-| allocation growth | 8 per tick | **-0.03** | — | constant degradation |
+| allocations per tick | 2 (after W1a and W1b) | 0.01 | 200x | a new path that reserves per tick |
+| allocation growth | 8 per tick | **-0.01** | — | constant degradation |
 | cost per tick | 3x + 5,000 ns | <= 1.02 with no load / 1.56 with the whole short loop in parallel | — | an order-of-magnitude degradation |
 | cost per visit | 3x + 5,000 ns | <= 1.01 | — | the same on the observer's path |
 
@@ -479,8 +526,8 @@ residue test: `longMatchChurnResidueBudget = 64 KiB` for a thousand observers th
 go (`longMatchChurnObservers = 1000`).
 
 **The caps are tightened because the figure that justified them no longer exists.** The slope of
-allocations per peer goes from 12.0 to **3.0** (measured 0.00 without the detector and 0.50 with it), and the
-absolute per tick from 400 to **24** (measured 6.05). With the old caps the first of the
+allocations per peer goes from 12.0 to **2.0** (measured 0.00 without the detector and 0.50 with it), and the
+absolute per tick from 400 to **2** (measured 0.01). With the old caps the first of the
 falsifications **passes**, which is exactly what a cap with twelve times of slack does.
 
 **What that file does NOT measure**, written down so that the next session does not read it as more
@@ -736,16 +783,26 @@ fixed was **the way of measuring**, not the tolerance:
    cheaper.** With the tick 42% down, a tolerance written as "20% of the reference"
    shrank on its own and started failing without the distribution changing.
 
-## 9. The suite is over the budget: the options, measured, and none of them taken
+## 9. The suite was over the budget: the options, measured, and the one that was taken
 
-**The state.** The full suite is **778,5 s** against the **10 minutes (600 s)** of
-`AGENTS.md`'s rule 7. RAM is **116,6 MB** against ~500 MB, so **the clock is the whole of
-the problem and the memory is not close to it**. The critical path is **`internal/sim`**
+**The state, before.** The full suite was **778,5 s** against the **10 minutes (600 s)** of
+`AGENTS.md`'s rule 7. RAM was **116,6 MB** against ~500 MB, so **the clock was the whole of
+the problem and the memory was not close to it**. The critical path was **`internal/sim`**
 (772,3 s of the 778,5), because the five capture replays run **in real time on purpose**:
 the server emits `0x0A` per tick and not per input (`Options.ReplaySpeed`), so a faster
 replay measures the harness and not the server.
 
-**Nothing in this section was changed.** Which tests execute is not a decision this file
+**What was taken: option 1, and it is measured.** The generated `sim_*_test.go` body now
+calls `t.Parallel()`, so the five real captures and the two synthetic fixtures replay at the
+same time instead of one after another; the replays already bind OS-assigned ports, so they
+do not collide. `internal/sim` is **338,4 / 338,6 / 339,2 s** over three consecutive full
+runs and the whole suite is **~400 s**, inside the budget. Section 1 has the table. The
+prediction below was **~350-400 s**, and the caveat it carried — that concurrent replays
+raise CPU contention exactly where the settle window and the tick cadence live — is real:
+one run with an extra process sampler alongside it flipped a verdict on the one-second
+synthetic fixture. Without the sampler the tree passed three consecutive full runs.
+
+**Nothing else in this section was changed.** Which tests execute is not a decision this file
 gets to take; it is the user's. What follows is the arithmetic that a decision needs.
 
 ### Where the 778,5 s actually is
@@ -805,8 +862,8 @@ Each with what it does to the clock and what it costs. **The gap to close is 178
 
 | | option | saving | suite | what it costs |
 |---|---|---|---|---|
-| **1** | **Replay the five captures concurrently** | the 678 s of *waiting* overlaps; the critical path becomes the **longest single capture**, 250 s | **~350-400 s** | nothing compared: **every byte of every capture is still compared**. It needs `t.Parallel()` in the **generated** `sim_*_test.go` (`cmd/gensim`), so it is a generator change, not a flag. **Unverified**: port independence is designed for (`AGENTS.md`: the harness takes free ports) but five concurrent replays raise CPU contention exactly where it hurts — the settle window and the tick cadence, which must-match depends on |
-| **2** | **Skip the settle for the captures with no observer** (`205830`, `201122`) | 2 × (1.25 − 0.40 floor) = **~1.7 s** | ~777 s | a rule, not a trim: the settle exists for the observer step and there is no observer in those two. **Tiny.** Worth doing only if option 1 is refused |
+| **1** | **Replay the five captures concurrently** | the 678 s of *waiting* overlaps; the critical path becomes the **longest single capture**, 250 s | **~350-400 s** | nothing compared: **every byte of every capture is still compared**. It needs `t.Parallel()` in the **generated** `sim_*_test.go` (`cmd/gensim`), so it is a generator change, not a flag. **Verified since** (section 1): port independence holds, and the CPU contention it was feared to raise showed up once, on the one-second synthetic fixture, under an extra sampler |
+| **2** | **Skip the settle for the captures with no observer** (`205830`, `201122`) | 2 × (1.25 − 0.40 floor) = **~1.7 s** | ~777 s | a rule, not a trim: the settle exists for the observer step and there is no observer in those two. **Tiny.** Taken as well, because it is a rule and not a trade |
 | **3** | **Trim the five committed captures into their slack** | **≤ ~26 s** | ~752 s | **gives up the prefix property.** A trim `CheckTrim` does not ACCEPT must not be imported, and the ones left are inside the settle's margin |
 | **4** | **Drop `2026-09-30_010531`** | **−250 s** | **~528 s** | one of the two deliberately-alike observer handshakes. `012528` still covers an observer, so this is **redundancy**, not coverage — but it *is* a coverage decision |
 | **5** | **Drop `010531` and `2026-09-30_183120`** | **−340 s** | **~438 s** | as above, and the observer-handshake pair with it |
@@ -822,16 +879,20 @@ decision, and it is the user's. Option 3 buys it by weakening the evidence. Opti
 correct and worth ~2 s. **Option 1 leaves all 678 s of recorded clock compared, byte for
 byte, and only stops *waiting* for it.**
 
-**And the honest caveat, before anyone acts on it**: option 1 is **not measured**, because
-measuring it means changing the generator, which is the thing being decided. What is
+**And the honest caveat, as it was written before the experiment**: option 1 was **not
+measured** at the time, because
+measuring it means changing the generator, which is the thing being decided. What was
 measured is the three facts it rests on — the replays are **load-independent** (the suite's
 clock moved 770,4 → 778,5 s under a machine at 54-71 %, and all of that is explained by the
 settle and the load); the harness **already takes free ports per replay**, so the replays do
 not collide; and the RAM headroom is large (**116,6 MB** against ~500 MB, and the peak is a
-sum over at most 5 binaries, so concurrency multiplies the small part). **What is not known
-is whether five concurrent replays hold the settle window** on a machine that is also running
-the race detector. **That is the experiment to run before choosing it**, and it is not run
-here.
+sum over at most 5 binaries, so concurrency multiplies the small part). **What was not known
+was whether five concurrent replays hold the settle window** on a machine that is also running
+the race detector. **That was the experiment to run before choosing it, and it has since been
+run**: the answer is in section 1 — `internal/sim` at 338,4 / 338,6 / 339,2 s over three
+runs, the whole suite ~400 s, the peak summed working set 159,9 MB, and one flake on the
+one-second synthetic fixture under an extra sampler, which is the CPU contention this
+paragraph warned about and is documented rather than hidden.
 
 **What is not recommended and why**: option 4 or 5 on their own. They fit the budget, and
 they are the wrong trade — they are the only options on this list that make the suite

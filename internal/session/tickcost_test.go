@@ -381,18 +381,19 @@ const (
 	// nanoseconds. It is deliberately loose and says so: it exists to catch a tick
 	// an order of magnitude more expensive, not a 10% regression, which is more
 	// than this machine's clock resolves honestly (the 34 measured 19 zeroed
-	// buckets out of 55 for a single tick). Measured 45 us at 32 peers, and 585 us
-	// under -race, whose shadow bookkeeping is a large multiple of the work; the
-	// ceiling is 3,4 times the larger of the two, and the exact per-tick statement
-	// in this file is the ALLOCATION count, which is a counter and not a clock.
+	// buckets out of 55 for a single tick). Measured 11,1 us at 32 peers, and
+	// 307 us under -race, whose shadow bookkeeping is a large multiple of the
+	// work; the ceiling is 6,5 times the larger of the two, and the exact per-tick
+	// statement in this file is the ALLOCATION count, which is a counter and not a
+	// clock.
 	costMaxNsPerTick = 2_000_000
 
 // costMaxNsPerTickPerPeer is the same figure as a slope over the peer count,
 	// which is what says the tick is not secretly quadratic in the peers. The tick
 	// walks the peers' queue records twice (queueEntries and the drain) and
-	// reconciles them once, so it is linear in the peers. Measured 1,4 us a peer
-	// and 11 us under -race, whose shadow bookkeeping is itself per peer per tick,
-	// so the bound is 2,7 times the larger of the two: enough to hold in both
+	// reconciles them once, so it is linear in the peers. Measured 0,34 us a peer
+	// and 9,34 us under -race, whose shadow bookkeeping is itself per peer per
+	// tick, so the bound is 3,2 times the larger of the two: enough to hold in both
 	// modes and still several times below what a pairwise reconciliation costs
 	// (the falsification is in SESSION-JOURNAL.md 38).
 	costMaxNsPerTickPerPeer = 30_000
@@ -416,11 +417,12 @@ const (
 
 	// costMaxBytesPerTick is the garbage one tick produces, at the largest peer
 	// count: the exact allocation rate (TotalAlloc, which counts every allocation
-	// whether or not the collector has taken it). Measured 5 KiB at 32 peers,
-	// which is 40 KiB a second of collector work at the recorded tick rate; the
-	// ceiling is 12 KiB, a little over twice the measurement. It used to be 32 KiB
-	// against 11 KiB, when the ack body and the store's copy of it were both
-	// allocated every tick.
+	// whether or not the collector has taken it). Measured 0 B at 32 peers, and
+	// 2,2 KiB under -race, whose shadow bookkeeping allocates per peer per tick.
+	// The ceiling is 12 KiB, which is no longer a tight bound on a measurement but
+	// a guard: it fails the moment a per-tick allocation comes back, which is what
+	// it was 32 KiB against 11 KiB for, when the ack body and the store's copy of
+	// it were both allocated every tick.
 	costMaxBytesPerTick = 12 << 10
 
 	// costMaxNsPerObserverVisit bounds ONE visit to one observer. It is a price per

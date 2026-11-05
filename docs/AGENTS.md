@@ -300,8 +300,8 @@ The cut is by **recorded clock**, not by capture name, with the budget as a cons
 the code (`src_go/internal/sim/short.go`):
 
 ```
-go test -short ./...          the short loop: 41 s. Long captures are skipped
-go test ./... -count=1        the full suite: 762 s, or the CI command
+go test -short ./...          the short loop: ~49 s. Long captures are skipped
+go test ./... -count=1        the full suite: ~400 s, or the CI command
 ```
 
 `ShortModeBudget = 20s`. The synthetic fixture records ~1 s and the shortest real capture
@@ -323,7 +323,7 @@ a capture out of the short loop by accident, or it keeps one in forever.
 An honest caveat, measured: a `go test` of a package that passes **prints nothing** of what
 the test binary wrote (checked on this toolchain with a test that prints through stdout,
 through `t.Log` and through stderr). Without `-v` all that is left is the time on the `ok`
-line, 41 s against 768 s. With `-v` or `-json` it is all there.
+line, ~49 s against ~400 s. With `-v` or `-json` it is all there.
 
 ## What the harness decides
 
@@ -609,8 +609,10 @@ internal/sim/testdata/<capture>/        only if -verify ACCEPTED
 > 113.6 MB** short and **775.6 s / 116.0 MB** full, `internal/sim` 770.8 s; the 44 had
 > **52.3-55.1 s / 112.3 MB** and **778.5 s / 116.6 MB** under a machine at 54-71%, so the
 > short loop's clock is **not** comparable between them and the full suite's is). **The suite
-> is over the 600 s budget and the options are in [`PERFORMANCE.md`](PERFORMANCE.md) 9**,
-> measured, and **none of them has been taken**. And the **why** of the caps, and the
+> was over the 600 s budget and the options are in [`PERFORMANCE.md`](PERFORMANCE.md) 9**,
+> measured, and **option 1 has been taken**: the capture replays run concurrently, so the
+> full suite is now **~400 s** and `internal/sim` **338.4 / 338.6 / 339.2 s** over three
+> consecutive runs. And the **why** of the caps, and the
 > sampler's methodology, in `PERFORMANCE.md` 0 and 2. The table is left here for its context.
 
 With the working set of the test binaries of **this repo** added up every 400 ms, and in
