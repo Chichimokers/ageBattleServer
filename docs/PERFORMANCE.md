@@ -101,8 +101,9 @@ of every `*test*` process every 500 ms while the suite runs, which is the method
 section 2, and reports the peak of that sum and the peak of any single binary. Over a full
 green run: **peak sum 159,9 MB**, at a moment when `battleserver.test`, `proxy.test`,
 `server.test` and `session.test` were alive together; **peak single 70,9 MB**, `sim.test`.
-The two peaks did not coincide — `sim.test` runs for 337 s on its own while the other
-packages finish in the first 40 — so the worst case is bounded by their sum, **230,8 MB**,
+The two peaks did not coincide: the summed peak was recorded at a moment when `sim.test` was
+not among the live binaries, and `sim.test`'s own peak came while the short packages had
+already finished. So the worst case is bounded by their sum, **230,8 MB**,
 which is still under half of the **500 MB** of the definition of done. The figure is a
 **floor** and not an exact maximum: a spike shorter than the 500 ms interval can be missed.
 
