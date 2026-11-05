@@ -90,7 +90,7 @@ longer waits for the observer step's period on a capture that has no observer to
 | `go test ./... -count=1 -timeout 25m` | 775,6 s | **~400 s wall clock** |
 | `internal/sim` | 770,809 s | **338,4 / 338,6 / 339,2 s** over three runs |
 | `go test -short ./... -count=1` | ~49 s | ~49 s (unchanged: the long captures are skipped) |
-| peak working set of the test binaries, summed | 116,0 MB (one binary) | **159,9 MB** summed, **70,9 MB** the largest single one (`sim.test`); see below |
+| peak working set of the test binaries, summed | 116,0 MB (summed over up to four concurrent binaries) | **159,9 MB** summed, **70,9 MB** the largest single one (`sim.test`); see below |
 
 The critical path is now the longest single capture instead of the sum of them, which is what
 the plan predicted (~350-400 s). The three `internal/sim` figures are within 0,24 % of each
@@ -745,13 +745,16 @@ reason and its history; this list says **how much it costs** and **why it was le
 - **The ack body is not pooled**, by property and not out of caution: it leaves
   `internal/session`, N peers receive it, and nobody outside the package says "I do not
   need it any more"; a pool you hand to N times and return once is exactly how the same buffer
-  ends up in two messages. It is 95.4% of the bytes of the short-lived memory (section 5). For the
-  same reason the `sort.SliceStable` and its swapper are left unpooled (2 objects per
-  tick, and only in a flush with mixed slots), the snapshot of the queue records
-  (**2** objects per tick and session according to section 5's table), the `ForEachPeer` closure
-  (1 object per tick) and `subPool` (converting back to `[]byte` is the interface box from `Put`).
-  That the observer visit copied the frame list instead of using `GetFrames` was 31.9
-  extra allocations per tick, and the ns cap **does not** see it: that is why the path is the one it is.
+  ends up in two messages. **It is not allocated either, since W1a/W1b**: the tick writes it
+  into the frame store's open block (`Replay.Reserve`), so the store's copy *is* the body.
+  The 95.4% of the short-lived bytes that the body and its copy used to be (section 5) is
+  therefore gone, and so are the `sort.SliceStable` and its swapper, the queue-record
+  snapshot and the `ForEachPeer` closure: the measured rate is 0 objects and 0 B per tick at
+  every peer count (section 3). What is left untouched is `subPool` (converting back to
+  `[]byte` is the interface box from `Put`), and the observer's `GetFrames` path: that the
+  observer visit copied the frame list instead of using `GetFrames` was 31.9 extra
+  allocations per tick, and the ns cap **does not** see it: that is why the path is the one
+  it is.
 - **The per-peer checksum queue grows with no ceiling** if a peer uploads more than ten records
   per tick, because reconciliation drains at most ten per tick
   (`sub_1400E2590:374-381`). **That is what the original does too**, so it is not a

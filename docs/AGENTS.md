@@ -436,19 +436,22 @@ Pending — **the complete count, with what each one needs, is in
   observer in the same tick — is **closed from the binary**: it does not, and there is no arm
   that could (`SESSION-JOURNAL.md` §44.4).
 
-## THE SETTLE IS THE OBSERVER STEP'S PERIOD, NOT THREE TICKS
+## THE SETTLE IS THE OBSERVER STEP'S PERIOD, WHEN THERE IS AN OBSERVER
 
 The replay keeps reading after the last captured input for the observer step's own period,
-which is `interval+2` ticks, **1,25 s** at the defaults. It used to be three simulation
-periods (400 ms), which is **less than a third** of the step's period, and on the phases
-where the step came round after that the replay closed the connection before the frame was
-written and reported its own truncation as a divergence of the server — the 1-in-60
-`TestSim_synthetic` flake and, with another signature, the 1-in-9
-`TestReportSaysWhenEveryDivergenceHappened` one. The number comes from the server's own
-`ObserverUpdateIntervalTicks`, so the wait and the thing waited for cannot drift apart, and
-the report prints the arithmetic as a `settle window` deviation. **Enlarging a fixture does
-not fix this**: the settle is always derived from the last whole second of the recording.
-`SESSION-JOURNAL.md` §44.4, `internal/sim/replay.go` (`settleFor`).
+which is `interval+2` ticks, **1,25 s** at the defaults, **when the capture has an
+observer**. A capture with no observer has no step to wait for: its settle is the tick ack's
+own three simulation periods, **400 ms** (`settleFor`'s floor), which is what the two
+no-observer captures (`2026-09-28_205830`, `2026-09-30_201122`) use. For a capture with an
+observer it used to be three simulation periods (400 ms), which is **less than a third** of
+the step's period, and on the phases where the step came round after that the replay closed
+the connection before the frame was written and reported its own truncation as a divergence
+of the server — the 1-in-60 `TestSim_synthetic` flake and, with another signature, the
+1-in-9 `TestReportSaysWhenEveryDivergenceHappened` one. The number comes from the server's
+own `ObserverUpdateIntervalTicks`, so the wait and the thing waited for cannot drift apart,
+and the report prints the arithmetic as a `settle window` deviation. **Enlarging a fixture
+does not fix this**: the settle is always derived from the last whole second of the
+recording. `SESSION-JOURNAL.md` §44.4, `internal/sim/replay.go` (`settleFor`).
 
 ## THE TWO TRANSPORTS, AND HOW THE HARNESS READS THEM
 
