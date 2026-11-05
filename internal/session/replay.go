@@ -115,8 +115,9 @@ func (r *Replay) Base() int {
 //
 // The returned slice is the store's own memory. The caller must write it and
 // then call Commit before anything else reserves, and must not keep it after
-// that: the next block roll recycles nothing, but a later Commit publishes it as
-// a frame the store owns.
+// that: a later Commit publishes it as a frame the store owns, and a block roll
+// recycles the block's buffer for the next block, so the slice is only valid
+// until the next Reserve.
 func (r *Replay) Reserve(n int) []byte {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -253,4 +254,33 @@ func (r *Replay) GetFrames(first, last int) []Frame {
 		return nil
 	}
 	return r.frames[first-r.base : last-r.base+1]
+}
+
+// CopyFrames returns copies of the retained frames whose absolute numbers fall in
+// [first, last] inclusive, and whether the range is wholly inside what the store
+// holds. The refusal rules are GetFrames's, and so is the reason for them.
+//
+// It exists because the copy CANNOT be done outside the store's lock. The store
+// recycles the buffer of a block it drops (openBlockLocked reuses r.spare), so a
+// frame body is only valid until the next block roll, and a block roll happens on
+// the session tick with no session lock held: PopAckTick reserves inside the open
+// block, and Reserve is what drops the oldest block. A caller that took the
+// frames from GetFrames and copied them afterwards would be reading memory the
+// tick may already be writing, which is a data race and, worse, a resend of bytes
+// from a block that no longer holds them.
+func (r *Replay) CopyFrames(first, last int) ([]Frame, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if len(r.frames) == 0 || first < 0 || last < first {
+		return nil, false
+	}
+	if last >= r.total || first < r.base {
+		return nil, false
+	}
+	src := r.frames[first-r.base : last-r.base+1]
+	out := make([]Frame, len(src))
+	for i, f := range src {
+		out[i] = Frame{Type: f.Type, Body: append([]byte(nil), f.Body...)}
+	}
+	return out, true
 }
