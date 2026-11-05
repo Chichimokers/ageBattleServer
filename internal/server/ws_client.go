@@ -231,10 +231,16 @@ func (c *WsClient) writeLoop() {
 }
 
 // writeBatch writes the frames in order. Pooled frames go back to the pool once
-// written.
+// written, and the ones left unwritten go back too: a failed write ends the
+// connection, so nothing else can be holding them.
 func (c *WsClient) writeBatch(batch []wsOutbound) error {
-	for _, m := range batch {
+	for i, m := range batch {
 		if err := c.conn.WriteMessage(gws.OpcodeBinary, m.data); err != nil {
+			for _, rest := range batch[i:] {
+				if rest.pooled {
+					wsSendPool.Put(rest.data)
+				}
+			}
 			return err
 		}
 		c.counter.AddToCounter("BytesSent", float64(len(m.data)))
