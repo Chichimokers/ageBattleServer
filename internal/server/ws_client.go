@@ -212,6 +212,13 @@ func (c *WsClient) writeLoop() {
 		clear(batch)
 		c.mu.Lock()
 		c.queuedBytes -= batchBytes
+		if c.queuedBytes < 0 {
+			// abortLocked zeroed the counter while this batch was in flight, so the
+			// subtraction can go below zero. The connection is closed and the counter
+			// is not read again, but a negative queued-bytes is not a number any
+			// reader should have to reason about.
+			c.queuedBytes = 0
+		}
 		c.mu.Unlock()
 		if err != nil {
 			c.writeFailed(err)
@@ -340,6 +347,15 @@ func (c *WsClient) abortLocked() bool {
 	c.closed = true
 	c.draining = false
 	c.closeSocketLocked()
+	// The queued frames are not going to be written: the socket is closed. The
+	// ones SendMessage built come from wsSendPool, so they go back to it instead
+	// of being left to the collector. A plain Send payload is owned by its caller
+	// and must not be pooled.
+	for _, m := range c.sendQueue {
+		if m.pooled {
+			wsSendPool.Put(m.data)
+		}
+	}
 	c.sendQueue = nil
 	c.queuedBytes = 0
 	return !wasClosed
