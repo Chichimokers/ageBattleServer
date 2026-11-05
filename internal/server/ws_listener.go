@@ -74,7 +74,9 @@ func (h *wsEventHandler) OnClose(socket *gws.Conn, err error) {
 	h.mu.Unlock()
 
 	if wc != nil {
-		_ = wc.Close()
+		// The peer closed, so there is nothing left to deliver: abort and not
+		// Close, which would try to drain a queue into a socket that is gone.
+		wc.abort()
 	}
 
 	if h.listener != nil {
