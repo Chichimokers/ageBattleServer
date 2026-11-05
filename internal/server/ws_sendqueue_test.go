@@ -24,7 +24,8 @@ import (
 
 // dialWSNoRead dials the WebSocket port and never starts the read loop, so the
 // server's writes fill the socket and block. It is the paused peer the queue
-// exists for.
+// exists for. Its receive buffer is shrunk to the smallest the OS accepts, which
+// is half of the stall: see shrinkSendBuffer for the other half.
 func dialWSNoRead(t *testing.T, port int) *gws.Conn {
 	t.Helper()
 	h := &wsTestHandler{}
@@ -39,6 +40,22 @@ func dialWSNoRead(t *testing.T, port int) *gws.Conn {
 			t.Fatalf("WS dial: %v", err)
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// shrinkSendBuffer makes the server's own send buffer as small as the OS accepts.
+// The stall has to happen inside the test's payload, and the kernel's send buffer
+// is large enough to swallow it whole: Linux autotunes it up to tcp_wmem's 4 MiB,
+// so 800 KiB fits in the server's buffer, every write returns, and nothing is ever
+// queued. Shrinking the peer's receive buffer alone does not force the stall.
+func shrinkSendBuffer(t *testing.T, wc *WsClient) {
+	t.Helper()
+	tcp, ok := wc.conn.NetConn().(*net.TCPConn)
+	if !ok {
+		t.Skipf("the server connection is not TCP (%T): the stall cannot be forced", wc.conn.NetConn())
+	}
+	if err := tcp.SetWriteBuffer(4096); err != nil {
+		t.Fatalf("SetWriteBuffer: %v", err)
 	}
 }
 
@@ -63,10 +80,11 @@ func serverWsClientFor(t *testing.T, srv *Server, addr string) *WsClient {
 }
 
 // TestWsPausedReaderDoesNotStallTheSender is the property W5 buys. The paused
-// peer's receive buffer is 4 KiB and its reader never runs, so the server's writes
-// fill the window and block; 800 KiB is far more than the socket buffers take. The
-// send loop stands in for the main loop, and what is asserted is that it returns
-// and that a second connection is served while it is in flight.
+// peer's receive buffer is 4 KiB, the server's send buffer is 4 KiB and its reader
+// never runs, so the server's writes fill the window and block; 800 KiB is far
+// more than those buffers take. The send loop stands in for the main loop, and
+// what is asserted is that it returns and that a second connection is served while
+// it is in flight.
 func TestWsPausedReaderDoesNotStallTheSender(t *testing.T) {
 	srv, port := wsTestServer(t)
 
@@ -78,6 +96,7 @@ func TestWsPausedReaderDoesNotStallTheSender(t *testing.T) {
 		_ = tcp.SetReadBuffer(4096)
 	}
 	wcPaused := serverWsClientFor(t, srv, paused.LocalAddr().String())
+	shrinkSendBuffer(t, wcPaused)
 
 	reader, readerH := dialWS(t, port)
 	defer func() { _ = reader.WriteClose(1000, nil) }()
@@ -137,6 +156,7 @@ func TestWsSendQueueCapClosesTheConnection(t *testing.T) {
 		_ = tcp.SetReadBuffer(4096)
 	}
 	wc := serverWsClientFor(t, srv, paused.LocalAddr().String())
+	shrinkSendBuffer(t, wc)
 
 	wc.mu.Lock()
 	wc.maxQueuedBytes = 8 << 10
