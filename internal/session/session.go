@@ -822,8 +822,10 @@ func (s *Session) ReconnectPeer(id byte, conn PeerConnection, secret uint64) (Pe
 // exception is a count of 0 against an empty store: that request is served,
 // with nothing to send.
 //
-// The frames are copied out under the lock: the store shifts its frames in place
-// when it drops a block, so a window into it is not safe to send from.
+// The frames are copied out under the lock, bodies included: the store recycles
+// the buffer of a block it drops, so a frame body is only valid until the next
+// tick rolls a block. A reconnect is rare, so one copy per frame here is not a
+// per-tick cost, and it is what lets the store reuse its blocks.
 func (s *Session) ResendFrames(from int) ([]Frame, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -838,7 +840,11 @@ func (s *Session) ResendFrames(from int) ([]Frame, bool) {
 	if frames == nil {
 		return nil, false
 	}
-	return append([]Frame(nil), frames...), true
+	out := make([]Frame, len(frames))
+	for i, f := range frames {
+		out[i] = Frame{Type: f.Type, Body: append([]byte(nil), f.Body...)}
+	}
+	return out, true
 }
 
 // HostID returns the peer the clients treat as the simulation host, or 0 when

@@ -57,6 +57,9 @@ type Replay struct {
 	// the open block, the one Reserve writes into; its capacity is the block's
 	// size, which is blockSize unless one frame needed more.
 	blocks [][]byte
+	// spare is the buffer of the block that was just dropped, kept so the next
+	// block reuses it instead of allocating. It is nil until the first roll.
+	spare []byte
 	// reserved is the slice Reserve handed out and Commit has not published yet.
 	// It is nil between ticks.
 	reserved []byte
@@ -169,9 +172,21 @@ func (r *Replay) openBlock() []byte { return r.blocks[len(r.blocks)-1] }
 
 // openBlockLocked opens a block able to hold a frame that needs `need` bytes
 // charged against it, and makes it the open one. Called with the lock held.
+//
+// The buffer of the block that was just dropped is reused when it is large
+// enough, which is what the original does and what makes a steady-state tick
+// allocate nothing. It is safe only because no frame outlives the tick: the
+// frames of the dropped block are gone from the store, and the one caller that
+// hands frames out (ResendFrames) copies them.
 func (r *Replay) openBlockLocked(need int) {
+	size := max(r.blockSize, need)
+	buf := r.spare
+	r.spare = nil
+	if cap(buf) < size {
+		buf = make([]byte, 0, size)
+	}
 	r.blockAt = append(r.blockAt, r.total)
-	r.blocks = append(r.blocks, make([]byte, 0, max(r.blockSize, need)))
+	r.blocks = append(r.blocks, buf[:0])
 	r.blockUsed = 0
 }
 
@@ -179,15 +194,16 @@ func (r *Replay) openBlockLocked(need int) {
 // and only when a new block is about to be opened, which is the only place the
 // store ever forgets anything.
 //
-// The block's buffer is not freed here: the frames that pointed into it are
-// dropped, and the collector takes the buffer once the last of them is gone. Both
-// arrays are compacted with copy and their emptied tails cleared, because
-// re-slicing them off the front would leave the dropped block reachable through
-// the backing array and the collector would keep it alive.
+// The block's buffer is kept as the spare the next block reuses, and the frames
+// that pointed into it are dropped. Both arrays are compacted with copy and their
+// emptied tails cleared, because re-slicing them off the front would leave the
+// dropped block reachable through the backing array and the collector would keep
+// it alive.
 func (r *Replay) dropOldestBlockLocked() {
 	if len(r.blockAt) == 0 {
 		return
 	}
+	r.spare = r.blocks[0]
 	n := copy(r.blockAt, r.blockAt[1:])
 	r.blockAt = r.blockAt[:n]
 	n = copy(r.blocks, r.blocks[1:])
