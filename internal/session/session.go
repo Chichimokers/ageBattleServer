@@ -295,6 +295,16 @@ type Session struct {
 	// Set by the Manager at session creation, together with pageSize.
 	maxPagesPerMatch int
 	pageSize         int
+
+	// tickEntries, tickTimedOut and tickFresh are the tick's own scratch: the
+	// peer snapshot PopAckTick builds, the slots in it whose sync deadline has
+	// passed, and whether that snapshot is still unconsumed. They are fields
+	// because the tick is one goroutine and because building the snapshot twice a
+	// tick was the duplicate walk this removes. SyncTimedOutPeers, which tests
+	// call, builds its own and never reads these.
+	tickEntries  []QueueEntry
+	tickTimedOut []byte
+	tickFresh    bool
 }
 
 func NewSession(id int64) *Session {
@@ -493,17 +503,35 @@ func (s *Session) PopAckTick() (ack []byte, notices [][]byte) {
 	// pending list filters on the marks, so the very first ack of a match is
 	// built with the marks already set. Building it first and marking afterwards
 	// left that one ack with an empty pending list.
-	if s.Ack.Started() {
+	started := s.Ack.Started()
+	if started {
 		s.ensureRecording()
 	}
-	entries := s.queueEntries(time.Now())
+	store := s.frameStore()
+	entries := s.queueEntries(time.Now(), s.tickEntries)
+	s.tickEntries = entries
+	// The sync-timeout answer comes out of the same walk, so the tick no longer
+	// walks the peers a second time for it. It is only published when the session
+	// has started carrying game data, which is the gate SyncTimedOutPeers applies:
+	// a peer of a session that never started is not reaped.
+	if started {
+		s.tickTimedOut = s.tickTimedOut[:0]
+		for _, e := range entries {
+			if e.TimedOut {
+				s.tickTimedOut = append(s.tickTimedOut, e.Slot)
+			}
+		}
+		s.tickFresh = true
+	}
 
-	ack = s.Ack.PopTick(entries)
-	if ack != nil {
+	ack = s.Ack.PopTickInto(entries, store)
+	if ack != nil && store != nil {
 		// The store is written before the message goes out. An observer that is
-		// already on the list is served from this store by the session tick, not by
-		// a second copy of the ack.
-		s.RecordFrame(protocol.MsgEndOfGameData, ack)
+		// already on the list is served from this store by the session tick, not
+		// by a second copy of the ack. The body was built inside the store's open
+		// block, so committing it publishes the bytes the players are about to
+		// get and copies nothing.
+		s.commitReservedFrame(protocol.MsgEndOfGameData)
 	}
 
 	for range reconcileMaxRounds {
@@ -522,25 +550,27 @@ func (s *Session) PopAckTick() (ack []byte, notices [][]byte) {
 // order, which is peer-add order, and resolves the two per-record tests the drain
 // makes on each record's peer.
 //
-// The session lock is not held across the ack state: the drain takes the ack
-// state's own lock and nothing takes them the other way round, but a caller that
-// wanted to be sure would have to hold both here.
-func (s *Session) queueEntries(now time.Time) []QueueEntry {
+// dst is the slice to append into, so the tick can pass its own scratch and
+// allocate nothing; a nil dst allocates. The session lock is not held across the
+// ack state: the drain takes the ack state's own lock and nothing takes them the
+// other way round, but a caller that wanted to be sure would have to hold both
+// here.
+func (s *Session) queueEntries(now time.Time, dst []QueueEntry) []QueueEntry {
+	entries := dst[:0]
 	s.mu.RLock()
-	entries := make([]QueueEntry, 0, len(s.peerOrder))
 	for _, id := range s.peerOrder {
 		p := s.Peers[id]
 		if p == nil {
 			continue
 		}
-		entries = append(entries, QueueEntry{Slot: p.ID, Participating: p.Participating})
+		entries = append(entries, QueueEntry{Slot: p.ID, Participating: p.Participating, peer: p})
 	}
 	s.mu.RUnlock()
 	for i := range entries {
 		// A record whose peer is not participating is skipped, and the timeout
 		// test inside that branch only runs for those.
 		if entries[i].Participating {
-			entries[i].TimedOut = s.syncTimedOut(entries[i].Slot, now)
+			entries[i].TimedOut = s.syncTimedOut(entries[i].peer, now)
 		}
 	}
 	return entries
@@ -574,6 +604,23 @@ func (s *Session) ForEachPeer(fn func(*Peer)) {
 	for _, id := range s.peerOrder {
 		if p := s.Peers[id]; p != nil {
 			fn(p)
+		}
+	}
+}
+
+// SendToAll sends one message to every peer of the session, in join order, under
+// the session's read lock. It is the allocation-free form of
+// ForEachPeer(func(p *Peer) { p.SendMessage(...) }): the closure that form needs
+// is one object per call, and the ack path calls it once per tick per message.
+//
+// The lock is held across the sends, exactly as ForEachPeer holds it, so a
+// transport whose send can block holds the session for as long as it blocks.
+func (s *Session) SendToAll(msgType byte, body []byte) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, id := range s.peerOrder {
+		if p := s.Peers[id]; p != nil {
+			_ = p.SendMessage(msgType, body)
 		}
 	}
 }
@@ -914,17 +961,20 @@ const defaultSyncTimeoutMS = 60000
 // clock starts at the peer's last upload.
 //
 // Only a drained queue can be late, so a peer still holding a backlog is spared
-// whatever the elapsed time is.
-func (s *Session) syncTimedOut(slot byte, now time.Time) bool {
-	p := s.GetPeer(slot)
-	if p == nil || !s.Ack.QueueEmpty(slot) {
+// whatever the elapsed time is. The peer is passed in because the drain's walk
+// already has it: looking it up again was a session lock per peer per tick.
+func (s *Session) syncTimedOut(p *Peer, now time.Time) bool {
+	if p == nil {
+		return false
+	}
+	empty, last, ok := s.Ack.SyncState(p.ID)
+	if !empty {
 		return false
 	}
 	timeout := time.Duration(p.TimeoutOverride) * time.Millisecond
 	if p.TimeoutOverride == 0 {
 		timeout = defaultSyncTimeoutMS * time.Millisecond
 	}
-	last, ok := s.Ack.LastSync(slot)
 	if !ok {
 		// Nothing queued yet: measure from when the peer joined, so a peer
 		// that never sends anything is eventually reaped.
@@ -956,7 +1006,7 @@ func (s *Session) SyncTimedOutPeers(now time.Time) []byte {
 		return nil
 	}
 	var timedOut []byte
-	for _, e := range s.queueEntries(now) {
+	for _, e := range s.queueEntries(now, nil) {
 		if e.TimedOut {
 			timedOut = append(timedOut, e.Slot)
 		}
@@ -1018,6 +1068,27 @@ func (s *Session) RemovePeerGracefully(peerID byte, byPeerID byte, reasonCode ui
 // peerRemovalGrace is the 30 s a removed peer is given.
 const peerRemovalGrace = 30 * time.Second
 
+// frameStore returns the session's frame store, or nil when it has not been
+// created yet.
+func (s *Session) frameStore() *Replay {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.replay
+}
+
+// commitReservedFrame publishes the frame PopTickInto reserved in the store and
+// advances the page count. The body is already in the store's open block, so
+// this copies nothing: it is the second half of the reservation the tick took.
+func (s *Session) commitReservedFrame(msgType byte) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.replay == nil {
+		return
+	}
+	s.replay.Commit(msgType)
+	s.PageCount++
+}
+
 // RecordFrame stores one frame of the session's ack stream in the frame store,
 // creating the store on the first one.
 //
@@ -1047,8 +1118,8 @@ const peerRemovalGrace = 30 * time.Second
 // The Recording flag is set here because it means "the store exists", not
 // "somebody uploaded something".
 //
-// body is the message body and is copied: the caller hands over the buffer it is
-// about to send, which its transport reuses.
+// body is the message body and is copied into the store's open block: the caller
+// hands over the buffer it is about to send, which its transport reuses.
 func (s *Session) RecordFrame(msgType byte, body []byte) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1438,9 +1509,18 @@ func (s *Session) closeExpiredPeers() {
 // It uses the immediate scheduler that refuses to override an existing deadline,
 // not the 30 s one RemovePeer uses, so a peer already on its way out keeps its
 // original reason and timing.
+//
+// The set comes from the walk PopAckTick already made this tick, so the peers are
+// not walked a second time for it. A Tick with no PopAckTick before it (a test, or
+// a tick whose ack was suppressed because the game ended) falls back to its own
+// walk, which is the same answer.
 func (s *Session) closeSyncTimedOutPeers() {
 	now := time.Now()
-	for _, id := range s.SyncTimedOutPeers(now) {
+	ids, fresh := s.takeTickTimedOut()
+	if !fresh {
+		ids = s.SyncTimedOutPeers(now)
+	}
+	for _, id := range ids {
 		p := s.GetPeer(id)
 		if p == nil {
 			continue
@@ -1449,6 +1529,17 @@ func (s *Session) closeSyncTimedOutPeers() {
 			log.Printf("Session %d: peer %d %s", s.ID, id, syncDataTimeoutReason)
 		}
 	}
+}
+
+// takeTickTimedOut returns the slots PopAckTick found past their sync deadline
+// and reports whether it had a snapshot to answer from. The snapshot is consumed,
+// so a second Tick without a new PopAckTick walks the peers itself.
+func (s *Session) takeTickTimedOut() ([]byte, bool) {
+	if !s.tickFresh {
+		return nil, false
+	}
+	s.tickFresh = false
+	return s.tickTimedOut, true
 }
 
 // syncDataTimeoutReason is the reason a peer is closed for letting its game-data

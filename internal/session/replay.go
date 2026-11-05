@@ -23,7 +23,9 @@ const frameOverhead = 57
 // observer joining late can be given is exactly the window the store still
 // holds, so the shape of the store is the shape of the answer the client gets.
 //
-//   - A block holds blockSize bytes: the -pageSize setting, default 65536.
+//   - A block holds blockSize bytes: the -pageSize setting, default 65536. A
+//     single frame larger than that gets a block of its own size, which is the
+//     original's own rule (max(pageSize, need)).
 //   - The store keeps at most maxBlocks blocks, ceil(peers * f) with peers
 //     floored at 8, where f is the -maxPagesToStorePerSession scale, 1.0 by
 //     default. 8 blocks in any real match.
@@ -33,6 +35,11 @@ const frameOverhead = 57
 //   - maxFrames is an optional cap in frames: 60000/ticksPerSec+1 until the game
 //     announces itself observable with maxObservers > 0, which is what AoE2DE
 //     does, so in practice it does not bound anything.
+//
+// The frames of one block are sub-slices of that block's buffer, so a block is
+// one allocation for every frame it holds and the store's bytes are the block's
+// bytes. A frame that is still referenced keeps its block alive after the store
+// has dropped it, which is why dropping a block needs no reference count.
 //
 // Base() is the absolute number of the first frame still held, which both the
 // StartObserveRequest handler and the observer update read.
@@ -46,6 +53,13 @@ type Replay struct {
 	maxFrames int // <= 0 disables the frame cap
 	blockAt   []int // absolute number of the first frame of each live block
 	blockUsed int   // bytes charged to the last (open) block
+	// blocks holds the live blocks' buffers, parallel to blockAt. The last one is
+	// the open block, the one Reserve writes into; its capacity is the block's
+	// size, which is blockSize unless one frame needed more.
+	blocks [][]byte
+	// reserved is the slice Reserve handed out and Commit has not published yet.
+	// It is nil between ticks.
+	reserved []byte
 }
 
 // NewReplay creates a frame store of at most maxBlocks blocks of blockSize
@@ -91,58 +105,105 @@ func (r *Replay) Base() int {
 	return r.base
 }
 
-// AddFrame stores one message. The caller keeps ownership of nothing: the body
-// is copied, because both callers hand over a buffer they are about to send or
-// return to a pool.
-func (r *Replay) AddFrame(msgType byte, body []byte) {
-	f := Frame{Type: msgType, Body: append([]byte(nil), body...)}
-	need := len(f.Body) + frameOverhead
-
+// Reserve returns a slice of n bytes inside the open block for the caller to
+// write a frame body into, opening a block when the current one cannot hold it.
+// The bytes are NOT published: Commit does that, so a reader can never see a
+// half-written frame.
+//
+// The returned slice is the store's own memory. The caller must write it and
+// then call Commit before anything else reserves, and must not keep it after
+// that: the next block roll recycles nothing, but a later Commit publishes it as
+// a frame the store owns.
+func (r *Replay) Reserve(n int) []byte {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	need := n + frameOverhead
 	switch {
 	case len(r.blockAt) == 0:
-		// First frame ever: it opens the first block.
-		r.blockAt = append(r.blockAt, r.total)
-	case need+r.blockUsed > r.blockSize:
-		// The last block is full. A new block is opened, and the oldest one
-		// goes when the count is already at the cap, which is the only place the
-		// store ever forgets anything.
+		r.openBlockLocked(need)
+	case need+r.blockUsed > cap(r.openBlock()):
+		// The open block is full. A new one is opened, and the oldest goes when
+		// the count is already at the cap, which is the only place the store
+		// ever forgets anything.
 		if len(r.blockAt) >= r.maxBlocks {
 			r.dropOldestBlockLocked()
 		}
-		r.blockAt = append(r.blockAt, r.total)
-		r.blockUsed = 0
+		r.openBlockLocked(need)
+	}
+	b := r.openBlock()
+	start := len(b)
+	b = b[:start+n]
+	r.blocks[len(r.blocks)-1] = b
+	r.reserved = b[start:]
+	r.blockUsed += need
+	return r.reserved
+}
+
+// Commit publishes the frame Reserve handed out as a frame of msgType. It is a
+// no-op when nothing is reserved.
+func (r *Replay) Commit(msgType byte) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	body := r.reserved
+	r.reserved = nil
+	if body == nil {
+		return
 	}
 	if r.maxFrames > 0 && r.total-r.base+1 > r.maxFrames {
 		r.trimToMaxFramesLocked()
 	}
-	r.frames = append(r.frames, f)
-	r.blockUsed += need
+	r.frames = append(r.frames, Frame{Type: msgType, Body: body})
 	r.total++
+}
+
+// AddFrame stores one message. The caller keeps ownership of nothing: the body
+// is copied into the store's open block, because both callers hand over a buffer
+// they are about to send or return to a pool.
+func (r *Replay) AddFrame(msgType byte, body []byte) {
+	copy(r.Reserve(len(body)), body)
+	r.Commit(msgType)
+}
+
+// openBlock is the block Reserve writes into. The store must have one.
+func (r *Replay) openBlock() []byte { return r.blocks[len(r.blocks)-1] }
+
+// openBlockLocked opens a block able to hold a frame that needs `need` bytes
+// charged against it, and makes it the open one. Called with the lock held.
+func (r *Replay) openBlockLocked(need int) {
+	r.blockAt = append(r.blockAt, r.total)
+	r.blocks = append(r.blocks, make([]byte, 0, max(r.blockSize, need)))
+	r.blockUsed = 0
 }
 
 // dropOldestBlockLocked forgets the oldest live block. Called with the lock held
 // and only when a new block is about to be opened, which is the only place the
 // store ever forgets anything.
 //
-// The block is recycled rather than freed: its entry list is cleared, it is
-// popped from the array and the emptied block is pushed back at the end, so the
-// blocks are a ring. With a cap of one the window therefore starts at the frame
-// that is about to be added.
+// The block's buffer is not freed here: the frames that pointed into it are
+// dropped, and the collector takes the buffer once the last of them is gone. Both
+// arrays are compacted with copy and their emptied tails cleared, because
+// re-slicing them off the front would leave the dropped block reachable through
+// the backing array and the collector would keep it alive.
 func (r *Replay) dropOldestBlockLocked() {
 	if len(r.blockAt) == 0 {
 		return
 	}
-	r.blockAt = r.blockAt[1:]
+	n := copy(r.blockAt, r.blockAt[1:])
+	r.blockAt = r.blockAt[:n]
+	n = copy(r.blocks, r.blocks[1:])
+	clear(r.blocks[n:])
+	r.blocks = r.blocks[:n]
 	if len(r.blockAt) == 0 {
 		r.base = r.total
+		clear(r.frames)
 		r.frames = r.frames[:0]
 		return
 	}
 	drop := r.blockAt[0] - r.base
 	r.base = r.blockAt[0]
-	r.frames = append(r.frames[:0], r.frames[drop:]...)
+	n = copy(r.frames, r.frames[drop:])
+	clear(r.frames[n:])
+	r.frames = r.frames[:n]
 }
 
 // trimToMaxFramesLocked drops whole blocks from the front until the retained

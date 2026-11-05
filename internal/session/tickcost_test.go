@@ -221,10 +221,10 @@ func costTick(d *sweepFixture, tick, uploads, checksums int) {
 	}
 	body, notices := d.s.PopAckTick()
 	if body != nil {
-		d.s.ForEachPeer(func(p *Peer) { _ = p.SendMessage(protocol.MsgEndOfGameData, body) })
+		d.s.SendToAll(protocol.MsgEndOfGameData, body)
 	}
 	for _, notice := range notices {
-		d.s.ForEachPeer(func(p *Peer) { _ = p.SendMessage(protocol.MsgGameData, notice) })
+		d.s.SendToAll(protocol.MsgGameData, notice)
 	}
 	d.s.Tick()
 	d.ticks++
@@ -400,26 +400,28 @@ const (
 	// costMaxAllocsPerPeerPerTick is the SLOPE of the allocation count against the
 	// peer count, over the points at or above the store's floor of eight. It is a
 	// slope and not a ratio because there is a fixed per-tick cost that does not
-	// scale with the peers (the ack body, the store's copy of it, the queue-record
-	// snapshot and the fixture's send closure: 4 objects at one peer, measured),
-	// and a ratio would read that fixed part as a per-peer cost.
+	// scale with the peers, and a ratio would read that fixed part as a per-peer
+	// cost.
 	//
 	// The 37 set this at 12,0 against a measured 9,30, and said in §37.9 that it
 	// caught "three or more extra allocations a peer" and deliberately let one or
 	// two through, because 9,30 and 9,81 were too close together for a tighter band
 	// to be about anything but the toolchain. That reason is gone: the per-peer
-	// allocations this path had are pooled or reused away (SESSION-JOURNAL.md 38)
-	// and the measured slope is now 0,00 without the detector and 0,50 with it, so
-	// the same sensitivity (three or more) sits at 3,0 with six times the margin over
-	// the race figure.
-	costMaxAllocsPerPeerPerTick = 3.0
+	// allocations this path had are pooled or reused away (SESSION-JOURNAL.md 38),
+	// the ack body is built inside the frame store's block and the queue-record
+	// snapshot is the session's own scratch, so the measured slope is 0,00 without
+	// the detector and 0,51 with it. The cap is 2,0: four times the race figure,
+	// and it fails on two extra objects a peer a tick.
+	costMaxAllocsPerPeerPerTick = 2.0
 
 	// costMaxBytesPerTick is the garbage one tick produces, at the largest peer
 	// count: the exact allocation rate (TotalAlloc, which counts every allocation
-	// whether or not the collector has taken it). Measured 11 KiB at 32 peers,
-	// which is 88 KiB a second of collector work at the recorded tick rate; the
-	// ceiling is 32 KiB, three times the measurement.
-	costMaxBytesPerTick = 32 << 10
+	// whether or not the collector has taken it). Measured 5 KiB at 32 peers,
+	// which is 40 KiB a second of collector work at the recorded tick rate; the
+	// ceiling is 12 KiB, a little over twice the measurement. It used to be 32 KiB
+	// against 11 KiB, when the ack body and the store's copy of it were both
+	// allocated every tick.
+	costMaxBytesPerTick = 12 << 10
 
 	// costMaxNsPerObserverVisit bounds ONE visit to one observer. It is a price per
 	// visit and not a share of the tick, because a share grows as the tick gets

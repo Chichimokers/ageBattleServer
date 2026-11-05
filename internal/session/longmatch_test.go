@@ -457,18 +457,19 @@ const (
 	longMatchHeapCeiling = 32 << 20
 
 	// longMatchMaxAllocsPerTick is the ceiling on Mallocs per tick in steady
-	// state. Measured: 6,01 in the first quarter and 6,00 in the last, and the
-	// whole of it is the ack path and the fixture's own send (ack.go: the body,
-	// the store's copy of it, the queue-record snapshot, and the reflective
-	// sort.SliceStable of a flush with mixed slots).
+	// state. Measured: 0,01 in the first quarter and 0,01 in the last. The tick
+	// allocates nothing per tick any more: the ack body is built inside the frame
+	// store's open block, the queue-record snapshot is the session's own scratch,
+	// and the send is a loop over the peers instead of a closure. What is left is
+	// the store's amortised block allocation, one 64 KiB block every few hundred
+	// ticks.
 	//
 	// It was 30,0 (31,0 under -race) with a ceiling of 48 when this was written,
-	// and the ceiling was never the interesting number: the per-client
-	// allocations behind those 30 are pooled or reused away (SESSION-JOURNAL.md
-	// 38), so the same sensitivity -- a new per-tick path that reserves something
-	// -- now sits at 24, four times the figure, and still fails on ten extra
-	// objects a tick over two hours of match.
-	longMatchMaxAllocsPerTick = 24
+	// then 24 against a measured 6,00. The ceiling is now 2, which is the
+	// sensitivity the old one claimed: a new per-tick path that reserves anything
+	// fails it, and two objects a tick over two hours of match is 115200 objects
+	// the tick did not use to make.
+	longMatchMaxAllocsPerTick = 2
 
 	// longMatchAllocGrowthBudget is how much the per-tick allocation cost may
 	// grow between the first and the last quarter, in Mallocs per tick. Measured:

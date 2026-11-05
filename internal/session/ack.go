@@ -124,6 +124,18 @@ func (a *AckState) QueueEmpty(slot byte) bool {
 	return q == nil || q.len() == 0
 }
 
+// SyncState answers the two questions the sync-timeout check asks about a slot,
+// under ONE lock: whether its game-data queue has drained, and when it last
+// uploaded. The check used to take this lock twice per peer per tick (QueueEmpty
+// and LastSync), which at 32 peers was 64 acquisitions a tick for an answer the
+// drain's own walk had already computed.
+func (a *AckState) SyncState(slot byte) (empty bool, last time.Time, ok bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	q := a.queued[slot]
+	return q == nil || q.len() == 0, a.lastSync[slot], a.lastSyncSet[slot]
+}
+
 // DropPeer empties both of a slot's queues. It is what a peer's game data and
 // checksum entries get on the way out, and there are two places that do it, the
 // difference being only what happens to the peer:
@@ -247,6 +259,10 @@ type QueueEntry struct {
 	Slot          byte
 	Participating bool
 	TimedOut      bool
+	// peer is the record's peer, carried so the timeout test does not have to
+	// look it up again under the session lock. It is nil for a record a caller
+	// built by hand, which is every test that constructs one.
+	peer *Peer
 }
 
 // Per-player queue caps: a packet is dropped when the peer's queue already
@@ -621,10 +637,32 @@ var noticeDeflate = sync.Pool{
 	},
 }
 
-// PopTick builds the next tick's 0x0A body and advances the state. entries is
-// the session's game-data queue records in the queue's own order, which is
-// peer-add order (see QueueEntry). It returns nil until the first game data or
-// checksum ack has been queued.
+// PopTick builds the next tick's 0x0A body into a fresh allocation and advances
+// the state. It is the form the tests use; the session calls PopTickInto with its
+// frame store so the body is built where the store keeps it.
+func (a *AckState) PopTick(entries []QueueEntry) []byte {
+	return a.popTick(entries, nil)
+}
+
+// PopTickInto builds the next tick's 0x0A body inside the frame store's open
+// block and advances the state. The store therefore keeps the exact bytes the
+// players got without a second copy, which is what the original does: its tick
+// allocates the 0x0A from the session's frame store and hands the same packet to
+// every peer.
+//
+// The returned slice is the store's memory and is not published as a frame until
+// the caller commits it (Replay.Commit). The caller must not retain it: every
+// transport builds its own frame buffer out of it.
+func (a *AckState) PopTickInto(entries []QueueEntry, store *Replay) []byte {
+	return a.popTick(entries, store)
+}
+
+// popTick is the one implementation behind PopTick and PopTickInto. A nil store
+// builds the body in a fresh allocation.
+//
+// entries is the session's game-data queue records in the queue's own order,
+// which is peer-add order (see QueueEntry). It returns nil until the first game
+// data or checksum ack has been queued.
 //
 // The body is filled by passes over the records, ackDrainPasses at most. Every
 // pass walks all the records in order, and for each participating peer:
@@ -646,7 +684,7 @@ var noticeDeflate = sync.Pool{
 // to take, and only if they fit under the same two limits; otherwise they wait in
 // the merged list. They are the previous ticks' entries: this tick's reconcile
 // runs after the body is built.
-func (a *AckState) PopTick(entries []QueueEntry) []byte {
+func (a *AckState) popTick(entries []QueueEntry, store *Replay) []byte {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if !a.started {
@@ -667,26 +705,35 @@ func (a *AckState) PopTick(entries []QueueEntry) []byte {
 		blockLen = 0
 	}
 
-	// Exact capacity. This body is NOT pooled, and the reason is ownership and
-	// not caution: it leaves this file. PopAckTick hands it to the frame store,
-	// which copies it, and to every peer in the session, and its lifetime ends in
-	// internal/server, where each transport builds its OWN frame buffer out of
-	// it. Nothing outside this package ever says "I am done with it", so there
-	// is nowhere to return it to, and a pool whose objects are handed out N
-	// times and returned once is how the same buffer ends up in two messages.
-	body := make([]byte, 0, 2+len(d.subs)+1+len(d.pending)+2+blockLen)
-	body = append(body, 0xfe, byte(d.count))
-	body = append(body, d.subs...)
-	body = append(body, byte(len(d.pending)))
-	body = append(body, d.pending...)
+	// The body is written straight into the store's open block when there is
+	// one, so the store's copy of the ack is the ack itself. The size is exact
+	// and known only after the drain, which is why the reservation is taken here
+	// and not before it.
+	size := 2 + len(d.subs) + 1 + len(d.pending) + 2 + blockLen
+	var body []byte
+	if store != nil {
+		body = store.Reserve(size)
+	} else {
+		body = make([]byte, size)
+	}
+	off := 0
+	body[off] = 0xfe
+	body[off+1] = byte(d.count)
+	off += 2
+	off += copy(body[off:], d.subs)
+	body[off] = byte(len(d.pending))
+	off++
+	off += copy(body[off:], d.pending)
 	if attach {
-		body = binary.LittleEndian.AppendUint16(body, uint16(blockLen))
-		body = append(body, 0x02)
-		body = binary.LittleEndian.AppendUint16(body, uint16(n))
-		body = append(body, a.merged...)
+		binary.LittleEndian.PutUint16(body[off:], uint16(blockLen))
+		body[off+2] = 0x02
+		binary.LittleEndian.PutUint16(body[off+3:], uint16(n))
+		off += 5
+		off += copy(body[off:], a.merged)
 		a.merged = a.merged[:0]
 	} else {
-		body = append(body, 0x00, 0x00)
+		body[off] = 0x00
+		body[off+1] = 0x00
 	}
 	a.subs = d.subs[:0]
 	a.pending = d.pending[:0]

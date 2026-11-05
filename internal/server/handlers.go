@@ -411,14 +411,10 @@ func (s *Server) sendEndOfGameDataTicks() {
 		// runs only after the 0x0A has already been sent. Each disagreeing
 		// round has its own notice, sent in round order.
 		if body != nil {
-			sess.ForEachPeer(func(p *session.Peer) {
-				s.sendToPeer(p.Conn, protocol.MsgEndOfGameData, body, false)
-			})
+			sess.SendToAll(protocol.MsgEndOfGameData, body)
 		}
 		for _, notice := range notices {
-			sess.ForEachPeer(func(p *session.Peer) {
-				s.sendToPeer(p.Conn, protocol.MsgGameData, notice, false)
-			})
+			sess.SendToAll(protocol.MsgGameData, notice)
 		}
 	}
 
