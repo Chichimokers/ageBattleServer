@@ -18,15 +18,15 @@ func wireFrame(msgType byte, body []byte) []byte {
 
 // lobbyConnectBody builds a valid LobbyConnect (0x15) body accepted by
 // protocol.ParseLobbyConnect for the given session ID. The reconnectState
-// mirrors the real game: a fresh join (the session creator, the first player)
-// uses 0; subsequent players and the server keep the session reconnectable
-// (state != 0), which observers require to get status 3 in StartObserve.
-func lobbyConnectBody(sessionID uint64, reconnectState byte) []byte {
+// mirrors the real game: a fresh join uses 0. Every connection gets its own
+// secret: the peer is identified by it on a reconnect, and a shared constant made
+// every player look like the host to the reconnect lookup.
+func lobbyConnectBody(sessionID uint64, reconnectState byte, secret uint64) []byte {
 	body := make([]byte, 0, 31)
 	var b8 [8]byte
 	binary.LittleEndian.PutUint64(b8[:], sessionID)
 	body = append(body, b8[:]...)
-	binary.LittleEndian.PutUint64(b8[:], 0x1234_5678_9abc_def0)
+	binary.LittleEndian.PutUint64(b8[:], secret)
 	body = append(body, b8[:]...)
 	body = append(body, reconnectState)
 	binary.LittleEndian.PutUint16(b8[:2], 5)

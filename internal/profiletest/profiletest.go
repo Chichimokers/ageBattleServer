@@ -162,7 +162,10 @@ func NextField(raw []byte, i int) (field, wire uint64, start, next int, ok bool)
 		return field, wire, after, after + 8, true
 	case 2: // length-delimited
 		size, end := Varint(raw, after)
-		if end == 0 || end+int(size) > len(raw) {
+		// Compare before converting: int(size) on a 32-bit build can wrap a
+		// huge declared length into a small positive number and accept a field
+		// that runs past the buffer.
+		if end == 0 || end > len(raw) || size > uint64(len(raw)-end) {
 			return 0, 0, 0, 0, false
 		}
 		return field, wire, end, end + int(size), true

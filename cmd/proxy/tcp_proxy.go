@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -342,10 +343,14 @@ func (s *TCPProxyServer) handleConnection(clientConn net.Conn, t1Port, t2Port, l
 	connWg.Wait()
 }
 
-// Start begins listening for TCP connections and blocks until Stop is called
+// Start blocks until Stop is called. The listeners must already be open: Bind
+// owns them, because the client-facing port has to be known and advertised
+// before the children start. Calling Bind here as well was the double bind: the
+// second bind either failed (the port was already owned by the first listener)
+// or, worse, left a listener nobody tracked.
 func (s *TCPProxyServer) Start() error {
-	if err := s.Bind(); err != nil {
-		return err
+	if len(s.listeners) == 0 {
+		return fmt.Errorf("proxy not bound: call Bind before Start")
 	}
 	<-s.quit
 	return nil
@@ -366,17 +371,31 @@ func (s *TCPProxyServer) Start() error {
 // was given.
 func (s *TCPProxyServer) Bind() error {
 	if err := s.listenAndServe(s.config.ProxyPort, s.config.Target1Port, s.config.Target2Port); err != nil {
+		s.closeListenersOnBindFailure()
 		return err
 	}
 	if s.config.ProxyWSPort != 0 {
 		if err := s.listenAndServe(s.config.ProxyWSPort, s.config.Target1WSPort, s.config.Target2WSPort); err != nil {
+			s.closeListenersOnBindFailure()
 			return err
 		}
 	}
 	if err := s.listenAndServe(s.config.ProxyOOBPort, s.config.Target1OOBPort, s.config.Target2OOBPort); err != nil {
+		s.closeListenersOnBindFailure()
 		return err
 	}
 	return nil
+}
+
+// closeListenersOnBindFailure releases the listeners a partial Bind already
+// opened. main exits on the error, but a caller or a test that reuses the proxy
+// object would otherwise keep those ports and accept loops alive.
+func (s *TCPProxyServer) closeListenersOnBindFailure() {
+	for _, ln := range s.listeners {
+		_ = ln.Close()
+	}
+	s.listeners = nil
+	s.clientPort = 0
 }
 
 // ClientPort is the TCP port the game connects to, the one the relay broadcast
@@ -408,6 +427,11 @@ func (s *TCPProxyServer) acceptLoop(ln net.Listener, t1Port, t2Port, listenPort 
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				// The listener was closed by Stop or by a partial Bind rollback:
+				// there is nothing to accept on it ever again.
+				return
+			}
 			select {
 			case <-s.quit:
 				return

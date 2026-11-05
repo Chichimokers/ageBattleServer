@@ -32,6 +32,9 @@ func (r *Runner) debugf(format string, args ...any) {
 
 // New builds a Runner for a ws://host:port/ endpoint.
 func New(wsURL string, profile Profile) (*Runner, error) {
+	if err := profile.validate(); err != nil {
+		return nil, err
+	}
 	u, err := url.Parse(wsURL)
 	if err != nil {
 		return nil, fmt.Errorf("parse ws url: %w", err)
@@ -80,13 +83,26 @@ func (r *Runner) Run(ctx context.Context) Report {
 	cancel()
 	wg.Wait()
 
+	after := ReadResourceStats()
+	diff := before.Diff(after)
 	rep := Report{
 		Profile:        r.profile,
 		Stats:          r.stats.snapshot(),
 		Elapsed:        time.Since(start),
-		CPUUsedSeconds: before.Diff(ReadResourceStats()).CPUUsedSeconds,
+		CPUUsedSeconds: diff.CPUUsedSeconds,
+		HeapBytes:      diff.HeapBytes,
+		AllocsBytes:    diff.AllocsBytes,
+		AllocsObjs:     diff.AllocsObjs,
 	}
 	return rep
+}
+
+// playerSecret is the reconnect secret of one connection. It is derived from the
+// match and the player index, so it is stable for a run and distinct for every
+// player of a match: the server looks a reconnecting peer up by this number
+// inside the session, and a constant made the second player resume the first.
+func playerSecret(matchIdx, playerIdx int) uint64 {
+	return 0x9E37_0000_0000_0000 | (uint64(matchIdx+1) << 16) | uint64(playerIdx+1)
 }
 
 // runMatch sets up one session and drives its traffic until ctx is done.
@@ -101,10 +117,9 @@ func (r *Runner) runMatch(ctx context.Context, matchIdx int, wg *sync.WaitGroup)
 		return
 	}
 	defer host.close()
-	// The session creator joins with reconnectState 0 (fresh join); the
-	// original rejects a reconnect (state != 0) to a session that does not
-	// exist yet, and the real game's creator sends 0.
-	if err := host.lobbyConnect(sid, 0); err != nil {
+	// The session creator joins with reconnectState 0 (fresh join), and every
+	// connection carries its own secret so no player resumes another's peer.
+	if err := host.lobbyConnect(sid, 0, playerSecret(matchIdx, 0)); err != nil {
 		r.debugf("match %d: host lobbyConnect: %v", matchIdx, err)
 		r.stats.recordError()
 		return
@@ -138,9 +153,10 @@ func (r *Runner) runMatch(ctx context.Context, matchIdx int, wg *sync.WaitGroup)
 			continue
 		}
 		players = append(players, p)
-		// Subsequent players reconnect (state 1) to the now-existing session,
-		// which marks it reconnectable so observers get status 3.
-		if err := p.lobbyConnect(sid, 1); err != nil {
+		// A fresh join (state 0) with this connection's own secret. A reconnect
+		// (state != 0) only resumes an existing peer and refuses a new one, so it
+		// cannot add players; each join is its own peer.
+		if err := p.lobbyConnect(sid, 0, playerSecret(matchIdx, i)); err != nil {
 			r.debugf("match %d: player %d lobbyConnect: %v", matchIdx, i, err)
 			r.stats.recordError()
 		}
@@ -206,9 +222,13 @@ func (r *Runner) hostLoop(ctx context.Context, host *wsPlayer, matchIdx int) {
 		case <-pageTick.C:
 			if err := host.send(0x09, gameDataPage(pagePayload(rng, r.profile.PageMaxBytes))); err != nil {
 				r.debugf("hostLoop: page send error: %v", err)
+				r.stats.recordError()
 			}
 		case <-pingTick.C:
-			_ = host.pingOnce()
+			if err := host.pingOnce(); err != nil {
+				r.debugf("hostLoop: ping error: %v", err)
+				r.stats.recordError()
+			}
 		}
 	}
 }
@@ -232,9 +252,15 @@ func (r *Runner) playerLoop(ctx context.Context, p *wsPlayer, matchIdx int, srcP
 					dst++
 				}
 			}
-			_ = p.send(0x13, relayBody(srcPeer, dst, rng))
+			if err := p.send(0x13, relayBody(srcPeer, dst, rng)); err != nil {
+				r.debugf("playerLoop: relay send error: %v", err)
+				r.stats.recordError()
+			}
 		case <-pingTick.C:
-			_ = p.pingOnce()
+			if err := p.pingOnce(); err != nil {
+				r.debugf("playerLoop: ping error: %v", err)
+				r.stats.recordError()
+			}
 		}
 	}
 }

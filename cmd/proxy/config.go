@@ -100,8 +100,8 @@ func loadConfig() Config {
 		SecondaryLogPath:   getEnv("SECONDARY_LOG_PATH", "secondary_log.csv"),
 		LogFilePath:        getEnv("LOG_FILE_PATH", "proxy.log"),
 		MitmTLS:            getEnvBool("MITM_TLS", true),
-		MitmCert:           getEnv("MITM_CERT", `F:\ageLANServer\build\server\resources\certificates\selfsigned_cert.pem`),
-		MitmKey:            getEnv("MITM_KEY", `F:\ageLANServer\build\server\resources\certificates\selfsigned_key.pem`),
+		MitmCert:           getEnv("MITM_CERT", filepath.Join(exeDir, "certs", "selfsigned_cert.pem")),
+		MitmKey:            getEnv("MITM_KEY", filepath.Join(exeDir, "certs", "selfsigned_key.pem")),
 		MitmKeyLog:         getEnv("MITM_KEYLOG", ""),
 	}
 }

@@ -243,19 +243,40 @@ func printUsage() {
 func normalizeArgs(args []string) []string {
 	result := make([]string, len(args))
 	copy(result, args)
-	for i := range result {
+	for i := 0; i < len(result); i++ {
 		if result[i] == "--" {
 			break
 		}
-		if strings.HasPrefix(result[i], "-") && !strings.HasPrefix(result[i], "--") {
-			// Lowercase only the flag name: a value passed with -flag=value
-			// (case-sensitive: secrets, file paths) must keep its case.
-			name, value, hasValue := strings.Cut(result[i], "=")
-			result[i] = "-" + strings.ToLower(strings.TrimLeft(name, "-"))
-			if hasValue {
-				result[i] += "=" + value
-			}
+		if !strings.HasPrefix(result[i], "-") {
+			continue
 		}
+		// Both -Flag and --Flag are the same flag: the flag package accepts one
+		// or two dashes, so the original's own spelling has to be normalized the
+		// same way either way. Only the name is lowercased; the value after "="
+		// keeps its case (it can be a path or a secret).
+		name, value, hasValue := strings.Cut(result[i], "=")
+		normalized := "-" + strings.ToLower(strings.TrimLeft(name, "-"))
+		if hasValue {
+			result[i] = normalized + "=" + value
+			continue
+		}
+		result[i] = normalized
+
+		// Do not lowercase the NEXT token when it is the value of a flag that
+		// takes one: "-name -MyServer" names the server "-MyServer", and
+		// lowercasing it would silently change what the operator asked for. A
+		// boolean flag takes no value, so it never consumes the token after it.
+		if i+1 >= len(result) {
+			continue
+		}
+		f := flag.CommandLine.Lookup(strings.TrimLeft(normalized, "-"))
+		if f == nil {
+			continue
+		}
+		if bf, ok := f.Value.(interface{ IsBoolFlag() bool }); ok && bf.IsBoolFlag() {
+			continue
+		}
+		i++
 	}
 	return result
 }

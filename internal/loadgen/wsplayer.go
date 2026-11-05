@@ -58,8 +58,13 @@ func dialWSPlayer(addr string, stats *Stats) (*wsPlayer, error) {
 
 func (p *wsPlayer) send(msgType byte, body []byte) error {
 	frame := wireFrame(msgType, body)
+	if err := p.conn.WriteMessage(gws.OpcodeBinary, frame); err != nil {
+		return err
+	}
+	// Counted only once the write succeeded: a failed send is an error and not
+	// traffic, and the old order made the report claim bytes that never left.
 	p.stats.recordSent(len(frame))
-	return p.conn.WriteMessage(gws.OpcodeBinary, frame)
+	return nil
 }
 
 func (p *wsPlayer) close() {
@@ -107,8 +112,8 @@ func (p *wsPlayer) waitType(want []byte, timeout time.Duration) (byte, []byte, b
 
 // lobbyConnect sends a LobbyConnect for sessionID and waits for the echo,
 // which (same-socket FIFO) confirms the client is registered in the session.
-func (p *wsPlayer) lobbyConnect(sessionID uint64, reconnectState byte) error {
-	body := lobbyConnectBody(sessionID, reconnectState)
+func (p *wsPlayer) lobbyConnect(sessionID uint64, reconnectState byte, secret uint64) error {
+	body := lobbyConnectBody(sessionID, reconnectState, secret)
 	if err := p.send(0x15, body); err != nil {
 		return err
 	}
