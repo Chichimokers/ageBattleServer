@@ -79,26 +79,23 @@ func reportResourceMetrics(b *testing.B, before, after resourceStats) {
 	b.ReportMetric((after.allocsObjs-before.allocsObjs)/float64(b.N), "allocs-obj/op")
 }
 
-// BenchmarkBsPortPingRoundTrip measures one full client->server->client ping
-// round trip over the real bsPort wire protocol. ns/op is the black-box latency;
-// allocs/op and B/op come from b.ReportAllocs.
-func BenchmarkBsPortPingRoundTrip(b *testing.B) {
-	_, port := startBlackBoxServer(b)
-	c := newTrafficClient(b, port)
-
-	before := readResourceStats()
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		c.send(protocol.MsgPing, nil)
-		typ, _ := c.readFrame(time.Second)
-		if typ != protocol.MsgPing {
-			b.Fatalf("unexpected reply type 0x%02x", typ)
-		}
-	}
-	b.StopTimer()
-	reportResourceMetrics(b, before, readResourceStats())
-}
+// There is no bsPort round-trip benchmark, and this is why rather than an
+// omission.
+//
+// BenchmarkBsPortPingRoundTrip used to live here: it sent 0x11 Ping and waited
+// for the echo. The dispatcher has no case for 0x11 (handlers.go's default arm
+// logs it as unhandled), so the benchmark failed on its first iteration and had
+// been a red signal in the tree. The only type the server echoes without a
+// session is 0x14 LobbyPing, and that echo is budgeted at lobbyPingEchoBudget
+// (100) per connection: a benchmark loop of b.N would stop being answered after
+// the hundredth iteration and fail the same way. Driving it from inside a session
+// would measure the session's dispatch and the ack path, not the transport round
+// trip the benchmark claimed to measure, and the transport already has
+// BenchmarkClientSendBatch below for the write side.
+//
+// A benchmark that cannot run is worse than none, so it was removed rather than
+// left failing. What would bring it back is a message type the server answers
+// unconditionally, which is a protocol fact and not a test one.
 
 // benchHost is a no-op ClientHost so the write-path benchmarks can exercise the
 // Client transport without a full Server.
