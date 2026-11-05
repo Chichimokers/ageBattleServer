@@ -1154,7 +1154,7 @@ func wsPayload(frame []byte) []byte {
 //
 // The two os.Exit paths ParseFlags can still take are the help flags and the
 // usage check on -simulationPeriod 0 together with an observer interval flag
-// (config.go:120-142). Both are checked here, and both mean the recorded command
+// (config.go:125-127 and :161-163). Both are checked here, and both mean the recorded command
 // line never produced a running server, so they are refused rather than
 // reproduced.
 func ConfigFromArgs(args []string) (*server.Config, []string, error) {

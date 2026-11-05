@@ -41,9 +41,9 @@ For local builds and configuration details, see
 ```
 
 The server accepts command-line options for listener ports, TLS certificate
-paths, session limits, observer settings, logging, and the in-process replay data
-callback. Run `-help` for the complete list. Keep private keys and passwords outside
-the repository; environment-specific configuration should not be committed.
+paths, session limits, observer settings, and logging. Run `-help` for the complete
+list. Keep private keys and passwords outside the repository; environment-specific
+configuration should not be committed.
 
 ## Use as a Go package
 
