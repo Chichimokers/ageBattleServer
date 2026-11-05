@@ -192,6 +192,21 @@ func discover(roots []string) (map[string]string, []string, error) {
 	return captures, order, nil
 }
 
+// sameText reports whether the bytes on disk already hold body, comparing after
+// normalising CRLF to LF.
+//
+// The generator emits LF. A Windows checkout with core.autocrlf=true has CRLF in
+// the working tree, so a byte comparison reports every generated file as out of
+// date on the one platform this project is developed on, and -check becomes a gate
+// that can never pass. The line ending is a checkout artifact and not content: git
+// stores LF either way, so normalising here cannot hide a real difference.
+func sameText(existing []byte, body []byte) bool {
+	if bytes.Equal(existing, body) {
+		return true
+	}
+	return bytes.Equal(bytes.ReplaceAll(existing, []byte("\r\n"), []byte("\n")), body)
+}
+
 // install copies a capture into testdata, unless the copy there is already
 // identical. A capture is the record of a run that cannot be repeated, so
 // overwriting a committed one is refused rather than done quietly: pass a
@@ -212,7 +227,7 @@ func install(src, dst string, check bool) error {
 			return err
 		}
 		to := filepath.Join(dst, name)
-		if existing, err := os.ReadFile(to); err == nil && bytes.Equal(existing, body) {
+		if existing, err := os.ReadFile(to); err == nil && sameText(existing, body) {
 			continue
 		} else if err == nil {
 			return fmt.Errorf("%s already exists in testdata with different content: a capture is the record of a run that cannot be repeated, so it is not overwritten", rel(filepath.Dir(dst), to))
@@ -236,7 +251,7 @@ func install(src, dst string, check bool) error {
 // to be able to say "all in date" by printing nothing at all.
 func write(path, body string, check bool) (bool, error) {
 	existing, err := os.ReadFile(path)
-	if err == nil && bytes.Equal(existing, []byte(body)) {
+	if err == nil && sameText(existing, []byte(body)) {
 		return false, nil
 	}
 	if check {

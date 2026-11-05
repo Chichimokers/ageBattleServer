@@ -54,6 +54,13 @@ jobs:
       - name: Short tests
         run: go test -short ./... -count=1
 
+      - name: The generated capture tests are in date
+        # cmd/gensim writes one sim_*_test.go per capture in testdata, and a
+        # capture added without regenerating them is a capture the suite does not
+        # replay. The comparison normalises CRLF, so this passes on a Windows
+        # checkout as well as here.
+        run: go run ./cmd/gensim -check internal/sim/testdata
+
       - name: The tick's cost
         run: go test ./internal/session -run 'TestTickCostAtEveryPeerCount|TestLongMatchMemoryAndCostAreBounded' -count=1 -v
 
