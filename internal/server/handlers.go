@@ -268,13 +268,23 @@ func (s *Server) handleLobbyReconnect(client messageClient, body []byte, info pr
 	sess := s.sessionManager.GetSession(key)
 	if sess != nil {
 		peer = sess.PeerBySecret(info.Secret)
-	}
-	if peer != nil && sess.PeerIDForConn(client) == peer.ID {
-		// The original drops a second 0x15 on a connection that already joined.
-		// Resuming the peer onto its own connection would close it as replaced.
-		logger.Debug("Server", "dispatch", "LOBBYCONNECT reconnect on the connection that holds peerID=%d, ignored from=%s",
-			peer.ID, client.RemoteAddr())
-		return
+		if current := sess.PeerIDForConn(client); current != 0 && peer != nil {
+			if current == peer.ID {
+				// The original drops a second 0x15 on a connection that already joined.
+				// Resuming the peer onto its own connection would close it as replaced.
+				logger.Debug("Server", "dispatch", "LOBBYCONNECT reconnect on the connection that holds peerID=%d, ignored from=%s",
+					peer.ID, client.RemoteAddr())
+				return
+			}
+			// The connection already holds a different peer, and a connection is one
+			// peer at a time: moving the resumed peer here would leave the first one
+			// orphaned in the session, with no connection to reach it. Refuse the
+			// reconnect and leave the connection as it was. The real client
+			// reconnects on a fresh connection, so this path is not in a normal match.
+			logger.Debug("Server", "dispatch", "LOBBYCONNECT reconnect refused, connection already holds peerID=%d and the secret resolves to peerID=%d from=%s",
+				current, peer.ID, client.RemoteAddr())
+			return
+		}
 	}
 	if peer != nil {
 		replaced, resumed = s.sessionManager.ReconnectPeer(sess, peer.ID, client, info.Secret)
@@ -334,8 +344,18 @@ const lobbyPingEchoBudget = 100
 func (s *Server) handleLobbyPing(client ClientConn, body []byte) {
 	logger.Debug("Server", "dispatch", "LOBBYPING from=%s", client.RemoteAddr())
 
-	// In a session: echo unconditionally.
+	// In a session, or observing one: echo unconditionally. An observer is not a
+	// session peer (its entry was removed when it started observing), but the
+	// original keeps its connection bound to the session and answers every ping;
+	// the budget is only for a connection with no session at all.
 	if s.sessionManager.FindSessionByPeer(client) != nil {
+		_ = client.SendMessage(protocol.MsgLobbyPing, body)
+		return
+	}
+	s.mu.RLock()
+	_, observing := s.observerSessions[client]
+	s.mu.RUnlock()
+	if observing {
 		_ = client.SendMessage(protocol.MsgLobbyPing, body)
 		return
 	}
@@ -530,7 +550,9 @@ func (s *Server) handleGameData(client messageClient, body []byte) {
 		return
 	}
 
-	s.metricsCollector.AddToCounter("BytesReceived", float64(len(body)))
+	// BytesReceived is counted once, by the transport that read the message, and
+	// not again here: the WebSocket handler already counted the whole message and
+	// adding the GameData body counted those bytes twice on that transport.
 	if !msg.IsReplayData() {
 		return
 	}
@@ -628,6 +650,13 @@ func (s *Server) handleStartObserve(client ClientConn, msgType byte, body []byte
 	// session. Every rejection is answered with its own byte, so pass the status
 	// straight through rather than collapsing it. Sent through SendMessage so the
 	// transport applies its own framing.
+	// A connection observes one session at a time. If it was watching another
+	// one, the old entry comes off when the new registration is accepted; a
+	// rejected request leaves the previous observation untouched.
+	s.mu.Lock()
+	previous := s.observerSessions[client]
+	s.mu.Unlock()
+
 	status, registered := sess.StartObserve(client, peerIdentifier, passwordHash)
 	// Status 0 is BOTH "no replay" and "accepted": the same byte goes on the wire
 	// either way, and the only thing that separates them is whether the client
@@ -648,6 +677,14 @@ func (s *Server) handleStartObserve(client ClientConn, msgType byte, body []byte
 	switch {
 	case accepted:
 		client.SetObserver(true)
+		if previous != nil && previous != sess {
+			// One connection, one observer entry: the previous session must not
+			// keep a live entry for a client that now watches another match.
+			previous.RemoveObserverConn(client)
+			// That may have been its last observer, in which case nothing else
+			// will erase it: no connection is closing on its behalf.
+			s.sessionManager.RemoveSessionIfVacant(previous)
+		}
 		s.mu.Lock()
 		s.observerSessions[client] = sess
 		s.mu.Unlock()
@@ -663,7 +700,7 @@ func (s *Server) handleStartObserve(client ClientConn, msgType byte, body []byte
 		// fe 00 02 01 02 00 00. An observer receives the same 0x0A
 		// stream as a player without ever being a member.
 		if id := sess.PeerIDForConn(client); id != 0 {
-			sess.RemovePeer(id)
+			s.sessionManager.RemovePeer(sess, id, client)
 		}
 		_ = client.SendMessage(protocol.MsgStartObserveResp, []byte{0})
 		logger.Debug("Server", "dispatch", "STARTOBSERVE accepted session=%d from=%s", sessionID, client.RemoteAddr())
@@ -731,9 +768,17 @@ func (s *Server) handleStopObserve(client ClientConn, body []byte) {
 	delete(s.observerSessions, client)
 	s.mu.Unlock()
 	if sess != nil {
+		// The original closes the observing connection as part of StopObserve.
+		// RemoveObserver keeps its identifier-based lookup; the connection sweep
+		// takes any duplicate entries the same connection accumulated.
 		sess.RemoveObserver(client)
+		sess.RemoveObserverConn(client)
+		s.sessionManager.RemoveSessionIfVacant(sess)
 	}
 	client.SetObserver(false)
+	// Close outside the session lock: a connection's close path reaches
+	// HandleDisconnect, which takes the manager and session locks.
+	_ = client.Close()
 	s.metricsCollector.AddToCounter("RemovePeerRequests", 1)
 	logger.Debug("Server", "dispatch", "STOPOBSERVE from=%s", client.RemoteAddr())
 }
@@ -811,11 +856,19 @@ func (s *Server) handleLobbyChecksumAck(client messageClient, body []byte, depth
 	if sess == nil {
 		return
 	}
-	// There is one vector per peer, and the vectors are reconciled across peers
-	// on the tick.
-	entries := make([]byte, 8*n)
-	copy(entries, body[1:off])
-	sess.QueueChecksumEntries(sess.PeerIDForConn(client), entries)
+	// Only a session member has a slot. A connection that stopped being a peer
+	// (an observer) resolves to no peer ID, and queueing under slot 0 would grow
+	// an entry that nobody owns. The nested message is still dispatched: the
+	// original runs it whatever the sender's membership, and only the checksum
+	// vector needs a slot.
+	slot := sess.PeerIDForConn(client)
+	if slot != 0 && sess.GetPeer(slot) != nil {
+		// There is one vector per peer, and the vectors are reconciled across
+		// peers on the tick.
+		entries := make([]byte, 8*n)
+		copy(entries, body[1:off])
+		sess.QueueChecksumEntries(slot, entries)
+	}
 	if off < len(body) {
 		s.dispatch(client, body[off], body[off+1:], depth+1)
 	}

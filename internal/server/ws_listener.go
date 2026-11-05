@@ -51,8 +51,22 @@ func (h *wsEventHandler) OnOpen(socket *gws.Conn) {
 	h.mu.Unlock()
 }
 
-func (h *wsEventHandler) OnClose(socket *gws.Conn, _ error) {
-	h.counter.AddToCounter("WsConnectionErrors", 1)
+func (h *wsEventHandler) OnClose(socket *gws.Conn, err error) {
+	// A close frame or a peer that hangs up is a normal end, not a connection
+	// error. The counter used to move on every close, which made a clean match
+	// look like a failing transport. gws reports a received close frame as a
+	// CloseError, so its normal codes are not errors either.
+	normalClose := false
+	var closeErr *gws.CloseError
+	if errors.As(err, &closeErr) {
+		switch closeErr.Code {
+		case 1000, 1001, 1005:
+			normalClose = true
+		}
+	}
+	if err != nil && !normalClose {
+		h.counter.AddToCounter("WsConnectionErrors", 1)
+	}
 
 	h.mu.Lock()
 	wc := h.clients[socket]
@@ -167,11 +181,12 @@ func (l *WsSocketListener) Start(_ context.Context) error {
 		go socket.ReadLoop()
 	})
 
-	l.httpSrv = &http.Server{
+	httpSrv := &http.Server{
 		Addr:      addr,
 		Handler:   mux,
 		TLSConfig: l.tlsConfig,
 	}
+	l.httpSrv = httpSrv
 
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -184,9 +199,9 @@ func (l *WsSocketListener) Start(_ context.Context) error {
 	go func() {
 		var err error
 		if l.secure {
-			err = l.httpSrv.Serve(tls.NewListener(ln, l.tlsConfig))
+			err = httpSrv.Serve(tls.NewListener(ln, l.tlsConfig))
 		} else {
-			err = l.httpSrv.Serve(ln)
+			err = httpSrv.Serve(ln)
 		}
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Error("WsTransport", "listen", "webSocketPort error: %v", err)
@@ -207,11 +222,17 @@ func (l *WsSocketListener) Stop() {
 		_ = conn.WriteClose(1000, []byte("server shutting down"))
 	}
 	l.conns = nil
+	srv := l.httpSrv
 	l.mu.Unlock()
 
-	if l.httpSrv != nil {
-		_ = l.httpSrv.Shutdown(context.Background())
+	if srv != nil {
+		_ = srv.Shutdown(context.Background())
 	}
+
+	l.mu.Lock()
+	l.httpSrv = nil
+	l.ln = nil
+	l.mu.Unlock()
 }
 
 func (l *WsSocketListener) IsSecure() bool {

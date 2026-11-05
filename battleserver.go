@@ -69,11 +69,15 @@ type Config struct {
 	ObserverSocketSkipMS uint
 	// SimulationPeriod is the simulation period in ms (0 = server default).
 	SimulationPeriod float64
-	// MaxPagesPerMatch caps replay pages per session (0 = no limit).
+	// MaxPagesPerMatch is the frame store's BLOCK count per session: the store
+	// keeps ceil(peers * value/8) blocks of PageSize bytes. 0 means the default
+	// of 8 blocks (one page per peer), not "unlimited"; the store is always
+	// finite and drops its oldest block when a new one is needed and all are full.
 	MaxPagesPerMatch uint
 	// MaxSessions caps concurrent sessions (0 = no limit).
 	MaxSessions uint
-	// PageSize is the replay page size (informational only).
+	// PageSize is the frame store's block size in bytes, not an informational
+	// field: a 0 here falls back to 65536.
 	PageSize uint
 	// AllowTimeoutOverride allows clients to override the socket timeout.
 	AllowTimeoutOverride bool

@@ -132,7 +132,7 @@ func (s *PingServer) loadOrGenerateCert() (tls.Certificate, error) {
 
 func generateDefaultCert() (tls.Certificate, error) {
 	// ECDSA P-256 default key: matches the certificate the upstream server presents,
-// and its generation and handshakes are far cheaper than RSA-2048 while keeping
+	// and its generation and handshakes are far cheaper than RSA-2048 while keeping
 	// the same security level. KeyEncipherment is deliberately omitted: the
 	// ECDSA key never does RSA key exchange.
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -220,8 +220,13 @@ func (s *PingServer) handleRaw(conn stdnet.Conn, reader *bufio.Reader) {
 	// plaintext, each echoed back, then performs the TLS handshake on the
 	// same connection. The handshake-phase deadline from handleConnection
 	// covers the first magic word; once one exchange succeeds the connection
-	// is proven alive and the deadline is lifted (pings can be minutes apart).
+	// is proven alive and every later read carries the idle deadline instead of
+	// no deadline at all.
+	established := false
 	for {
+		if established {
+			_ = conn.SetReadDeadline(time.Now().Add(oobIdleTimeout))
+		}
 		next, err := reader.Peek(1)
 		if err != nil {
 			return
@@ -241,7 +246,7 @@ func (s *PingServer) handleRaw(conn stdnet.Conn, reader *bufio.Reader) {
 			if _, err := conn.Write(word[:]); err != nil {
 				return
 			}
-			_ = conn.SetReadDeadline(time.Time{})
+			established = true
 		}
 	}
 }
@@ -255,11 +260,13 @@ func (s *PingServer) handleTLS(conn stdnet.Conn, reader *bufio.Reader) {
 		return
 	}
 	_ = tlsConn.SetDeadline(time.Time{})
-	_ = conn.SetDeadline(time.Time{})
 
 	// Inside TLS it still speaks WebSocket when the
-	// client upgrades (wss), otherwise raw RLink pings.
+	// client upgrades (wss), otherwise raw RLink pings. The peek carries the
+	// handshake deadline: a peer that completed TLS and then says nothing must
+	// not hold the goroutine forever.
 	tlsReader := bufio.NewReader(tlsConn)
+	_ = tlsConn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	if next, err := tlsReader.Peek(4); err == nil && string(next) == "GET " {
 		serveWS(tlsConn, tlsReader)
 		return
@@ -318,6 +325,9 @@ func wsFrame(payload []byte) []byte {
 }
 
 func serveWS(conn stdnet.Conn, reader *bufio.Reader) {
+	// The upgrade request carries a deadline too: a connection that opened and
+	// sent half a request must not pin the goroutine.
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	req, err := http.ReadRequest(reader)
 	if err != nil {
 		return

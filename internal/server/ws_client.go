@@ -33,6 +33,14 @@ type WsClient struct {
 	pinged               bool
 	closed               bool
 	observer             bool
+	// dispatchMu serializes Process and Close. A Close that arrives while a
+	// handler is being dispatched cannot take it (the handler may be the one
+	// asking for the close, as StopObserve is), so it sets closePending and
+	// Process performs the close once the handler returns. dispatching is read
+	// without the lock to tell those two cases apart.
+	dispatchMu   sync.Mutex
+	dispatching  atomic.Bool
+	closePending atomic.Bool
 	// peerIdentifier is the connection's observer identity, the u64 the observer
 	// list is keyed on (session.PeerConnection). Atomic because the session
 	// writes it from the message loop while the read goroutine is also on the
@@ -106,17 +114,52 @@ func (c *WsClient) SendMessage(msgType byte, body []byte) error {
 }
 
 func (c *WsClient) Close() error {
+	// A handler being dispatched may be the caller (StopObserve closes its own
+	// connection). Taking dispatchMu there would deadlock, so the close is
+	// deferred to Process, which owns the gate.
+	if c.dispatching.Load() {
+		c.closePending.Store(true)
+		if c.dispatching.Load() {
+			return nil
+		}
+		// Process finished between the two reads: the pending flag may have been
+		// set after its last check, so clear it and close here.
+		c.closePending.Store(false)
+	}
+
+	c.dispatchMu.Lock()
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
+		c.dispatchMu.Unlock()
 		return nil
 	}
 	c.closed = true
 	c.mu.Unlock()
+	c.dispatchMu.Unlock()
+
+	// Frames queued but not yet dispatched belong to no match any more: return
+	// their buffers to the pool instead of leaving them for a Process that will
+	// refuse them.
+	c.dropIncoming()
 
 	c.host.RemoveClient(c)
-	_ = c.conn.WriteClose(1000, nil)
+	if c.conn != nil {
+		_ = c.conn.WriteClose(1000, nil)
+	}
 	return nil
+}
+
+// dropIncoming discards every queued frame and returns its buffer to the pool.
+// Close uses it, and it is separate so the drain can be tested without a socket.
+func (c *WsClient) dropIncoming() {
+	c.mu.Lock()
+	frames := c.incoming
+	c.incoming = nil
+	c.mu.Unlock()
+	for _, data := range frames {
+		wsFramePool.Put(data)
+	}
 }
 
 func (c *WsClient) RemoteAddr() string {
@@ -139,13 +182,31 @@ func (c *WsClient) OverrideSilentTimeout(d time.Duration) {
 // when more than the limit has passed between its last message and now. A live
 // connection then has its queued messages dispatched.
 func (c *WsClient) Process(maxPackets int, now time.Time) {
+	c.dispatchMu.Lock()
+	c.dispatching.Store(true)
+
 	c.mu.Lock()
+	if c.closed {
+		// A frame that arrived before the close but is processed after it must
+		// not reach a handler: the connection is no longer part of the match.
+		frames := c.incoming
+		c.incoming = nil
+		c.mu.Unlock()
+		c.dispatching.Store(false)
+		c.dispatchMu.Unlock()
+		for _, data := range frames {
+			wsFramePool.Put(data)
+		}
+		return
+	}
 	limit := defaultSilentTimeout
 	if c.silentTimeout > 0 {
 		limit = c.silentTimeout
 	}
 	if silentFor := now.Sub(c.lastSeen); silentFor > limit {
 		c.mu.Unlock()
+		c.dispatching.Store(false)
+		c.dispatchMu.Unlock()
 		logger.Info("WsTransport", "Process", "closing connection, no message for %v (limit %v) from=%s",
 			silentFor.Round(time.Millisecond), limit, c.RemoteAddr())
 		_ = c.Close()
@@ -161,6 +222,11 @@ func (c *WsClient) Process(maxPackets int, now time.Time) {
 		c.observerSkip++
 		if c.observerSkip < c.skipMS {
 			c.mu.Unlock()
+			c.dispatching.Store(false)
+			c.dispatchMu.Unlock()
+			if c.closePending.Swap(false) {
+				_ = c.Close()
+			}
 			return
 		}
 		c.observerSkip = 0
@@ -173,7 +239,16 @@ func (c *WsClient) Process(maxPackets int, now time.Time) {
 	c.incoming = c.incoming[len(frames):]
 	c.mu.Unlock()
 
-	for _, data := range frames {
+	for i, data := range frames {
+		c.mu.Lock()
+		closed := c.closed
+		c.mu.Unlock()
+		if closed {
+			c.dropQueued(frames[i:])
+			c.dispatching.Store(false)
+			c.dispatchMu.Unlock()
+			return
+		}
 		msgType, body, ok := parseWsMessage(data)
 		if !ok {
 			logger.Debug("WsTransport", "onMessage", "malformed message %x from=%s", data, c.RemoteAddr())
@@ -182,6 +257,26 @@ func (c *WsClient) Process(maxPackets int, now time.Time) {
 		}
 		c.host.dispatchMessage(c, msgType, body)
 		wsFramePool.Put(data)
+		if c.closePending.Load() {
+			// A handler asked to close this connection. Finish the batch here,
+			// release the gate and let Close run: it cannot take dispatchMu from
+			// inside the dispatch that is asking for it.
+			c.dropQueued(frames[i+1:])
+			c.dispatching.Store(false)
+			c.dispatchMu.Unlock()
+			_ = c.Close()
+			return
+		}
+	}
+
+	c.dispatching.Store(false)
+	c.dispatchMu.Unlock()
+
+	// A Close that arrived from another goroutine while the batch was being
+	// dispatched may have seen dispatching=true and deferred to this point.
+	if c.closePending.Swap(false) {
+		_ = c.Close()
+		return
 	}
 
 	// The maxPackets cap may have left frames queued. Re-signal so the next
@@ -198,12 +293,32 @@ func (c *WsClient) Process(maxPackets int, now time.Time) {
 	}
 }
 
+// dropQueued returns a batch of frames and whatever is still queued to the pool.
+// It is used when a close is pending or the connection is already closed, and it
+// empties incoming so the close path cannot return the same buffer twice.
+func (c *WsClient) dropQueued(frames [][]byte) {
+	c.mu.Lock()
+	rest := c.incoming
+	c.incoming = nil
+	c.mu.Unlock()
+	for _, data := range frames {
+		wsFramePool.Put(data)
+	}
+	for _, data := range rest {
+		wsFramePool.Put(data)
+	}
+}
+
 // enqueue buffers a received WS frame for processing by Process. The incoming
 // message sits in the queue until the processing pass picks it up; here the
 // callback only queues the frame. The main loop is signaled on the
 // empty->non-empty transition so each queued batch is processed exactly once.
 func (c *WsClient) enqueue(data []byte) {
 	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return
+	}
 	c.lastSeen = time.Now()
 	if len(c.incoming) >= maxIncomingFrames {
 		c.mu.Unlock()

@@ -1,6 +1,7 @@
 package loadgen
 
 import (
+	"fmt"
 	"math/rand/v2"
 	"time"
 )
@@ -33,6 +34,25 @@ type Profile struct {
 	RelayInterval time.Duration
 	// PingInterval is each connection's LobbyPing keepalive cadence.
 	PingInterval time.Duration
+}
+
+// validate rejects a profile whose intervals would make time.NewTicker panic.
+// The load tool is driven from the command line, and "-pageinterval 0" used to
+// reach the ticker instead of being refused with an error.
+func (p Profile) validate() error {
+	switch {
+	case p.Matches < 0:
+		return fmt.Errorf("matches must not be negative: %d", p.Matches)
+	case p.Players < 1:
+		return fmt.Errorf("players must be at least 1 (the host): %d", p.Players)
+	case p.PageInterval <= 0:
+		return fmt.Errorf("page interval must be positive: %s", p.PageInterval)
+	case p.RelayInterval <= 0:
+		return fmt.Errorf("relay interval must be positive: %s", p.RelayInterval)
+	case p.PingInterval <= 0:
+		return fmt.Errorf("ping interval must be positive: %s", p.PingInterval)
+	}
+	return nil
 }
 
 // DefaultProfile returns the capture-derived profile. With the default

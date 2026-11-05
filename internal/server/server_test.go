@@ -392,9 +392,10 @@ func TestServerStartStop(t *testing.T) {
 
 // deadClient is a ClientConn with nothing behind it. AddClient only stores the
 // value in two maps and a counter, so this is enough to be one, and it keeps the
-// test below from needing a socket.
+// test below from needing a socket. Close is a method of its own because after
+// Stop the server now closes the late arrival instead of registering it.
 //
-// WHAT THIS IS FOR
+// # WHAT THIS IS FOR
 //
 // A connection the listener accepted a moment before it was closed is handed to
 // AddClient (bs_listener.go:46 -> NewClient -> server.go:480) by its own
@@ -409,7 +410,15 @@ func TestServerStartStop(t *testing.T) {
 //
 // The falsification is one line: put clientSet = nil back in Stop and this test
 // panics with "assignment to entry in nil map".
-type deadClient struct{ ClientConn }
+type deadClient struct {
+	ClientConn
+	closed bool
+}
+
+func (c *deadClient) Close() error {
+	c.closed = true
+	return nil
+}
 
 func TestAddClientAfterStopDoesNotPanic(t *testing.T) {
 	silenceLogger()
@@ -431,6 +440,16 @@ func TestAddClientAfterStopDoesNotPanic(t *testing.T) {
 	}
 
 	// The arrival the listener can still hand over after Stop. It must not take
-	// the process with it.
-	srv.AddClient(deadClient{})
+	// the process with it, it must not be registered, and it must be closed.
+	late := &deadClient{}
+	srv.AddClient(late)
+	if !late.closed {
+		t.Error("a connection handed to a stopped server was not closed")
+	}
+	if n := srv.clientCount.Load(); n != 0 {
+		t.Errorf("clientCount = %d after a late AddClient, want 0", n)
+	}
+	if len(srv.clients) != 0 {
+		t.Errorf("clients = %d after a late AddClient, want 0", len(srv.clients))
+	}
 }

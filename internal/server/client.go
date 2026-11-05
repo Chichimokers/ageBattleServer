@@ -165,6 +165,12 @@ func (c *Client) readLoop(ctx context.Context) {
 			}
 			return
 		}
+		if c.counter != nil {
+			// One count per message, on the transport that read it: BytesReceived
+			// used to be added only for GameData bodies, so every other message of
+			// this transport was invisible in the traffic counters.
+			c.counter.AddToCounter("BytesReceived", float64(len(body)+1))
+		}
 
 		c.mu.Lock()
 		closing := c.closed

@@ -9,7 +9,7 @@ import (
 
 func main() {
 	if len(os.Args) != 2 {
-		fmt.Fprintln(os.Stderr, "usage: go run tools/scripts/cmd/generateGoreleaserConfig.go GOROOT_LEGACY")
+		fmt.Fprintln(os.Stderr, "usage: cd tools/scripts && go run ./cmd/generateGoreleaserConfig.go GOROOT_LEGACY")
 		os.Exit(2)
 	}
 

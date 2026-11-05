@@ -77,6 +77,31 @@ func run(roots []string, out string, check bool) error {
 		return fmt.Errorf("no capture found in %s: a capture is a directory with a metadata.json in it", strings.Join(roots, ", "))
 	}
 
+	// The generated test's file name is ident(name), which maps every run of
+	// punctuation to one underscore. Two different captures can therefore want
+	// the same file, and the second would overwrite the first's test in silence.
+	idOwner := make(map[string]string, len(order))
+	for _, name := range order {
+		id := ident(name)
+		if prev, ok := idOwner[id]; ok {
+			return fmt.Errorf("captures %q and %q both map to the generated identifier %q: their tests would overwrite each other, so one has to be renamed", prev, name, id)
+		}
+		idOwner[id] = name
+	}
+	// A capture already installed in testdata collides the same way, and the
+	// generated file would overwrite one of the two without saying so.
+	installed, err := installedCaptures(testdata)
+	if err != nil {
+		return err
+	}
+	for _, name := range installed {
+		id := ident(name)
+		if prev, ok := idOwner[id]; ok && prev != name {
+			return fmt.Errorf("capture %q maps to the generated identifier %q, which the installed capture %q already uses: one has to be renamed", name, id, prev)
+		}
+		idOwner[id] = name
+	}
+
 	var stale []string
 	for _, name := range order {
 		src := captures[name]
@@ -107,10 +132,6 @@ func run(roots []string, out string, check bool) error {
 	live := make(map[string]bool, len(order))
 	for _, name := range order {
 		live[ident(name)] = true
-	}
-	installed, err := installedCaptures(testdata)
-	if err != nil {
-		return err
 	}
 	for _, name := range installed {
 		live[ident(name)] = true

@@ -217,6 +217,34 @@ func TestBoundPortsReportsAConfiguredPort(t *testing.T) {
 	}
 }
 
+// TestBoundPortsIsZeroAfterStop covers N-13: a port the server stopped
+// listening on is not a port a caller can dial.
+func TestBoundPortsIsZeroAfterStop(t *testing.T) {
+	silenceLogger()
+	srv, err := New(&Config{
+		EphemeralListenPorts: EphemeralBoth,
+		SimulationPeriod:     125,
+		LogLevel:             "none",
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := srv.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if bs, ws := srv.BoundPorts(); bs == 0 || ws == 0 {
+		t.Fatalf("BoundPorts after Start = %d/%d, want two real ports", bs, ws)
+	}
+	if err := srv.Stop(); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	if bs, ws := srv.BoundPorts(); bs != 0 || ws != 0 {
+		t.Errorf("BoundPorts after Stop = %d/%d, want 0/0", bs, ws)
+	}
+}
+
 func itoa(v int) string {
 	if v == 0 {
 		return "0"

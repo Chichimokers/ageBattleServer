@@ -19,6 +19,7 @@ type LobbyClient struct {
 	conn      net.Conn
 	mu        sync.Mutex
 	connected bool
+	stopped   bool
 	interval  time.Duration
 }
 
@@ -32,6 +33,9 @@ func NewLobbyClient(cfg *Config, host string, port uint) *LobbyClient {
 }
 
 func (c *LobbyClient) Start(ctx context.Context) error {
+	c.mu.Lock()
+	c.stopped = false
+	c.mu.Unlock()
 	if err := c.connect(); err != nil {
 		logger.Warning("Lobby", "connect", "lobby connect: %v (retrying)", err)
 	}
@@ -45,6 +49,13 @@ func (c *LobbyClient) Start(ctx context.Context) error {
 const dialTimeout = 5 * time.Second
 
 func (c *LobbyClient) connect() error {
+	c.mu.Lock()
+	if c.stopped {
+		c.mu.Unlock()
+		return errors.New("lobby client stopped")
+	}
+	c.mu.Unlock()
+
 	addr := net.JoinHostPort(c.host, fmt.Sprintf("%d", c.port))
 	conn, err := net.DialTimeout("tcp", addr, dialTimeout)
 	if err != nil {
@@ -52,6 +63,11 @@ func (c *LobbyClient) connect() error {
 	}
 
 	c.mu.Lock()
+	if c.stopped {
+		c.mu.Unlock()
+		_ = conn.Close()
+		return errors.New("lobby client stopped")
+	}
 	if c.conn != nil {
 		_ = c.conn.Close()
 	}
@@ -127,8 +143,12 @@ func (c *LobbyClient) loop(ctx context.Context) {
 		case <-ticker.C:
 			c.mu.Lock()
 			connected := c.connected
+			stopped := c.stopped
 			c.mu.Unlock()
 
+			if stopped {
+				return
+			}
 			if !connected {
 				_ = c.connect()
 			} else {
@@ -162,6 +182,7 @@ func (c *LobbyClient) Send(data []byte) error {
 
 func (c *LobbyClient) Stop() {
 	c.mu.Lock()
+	c.stopped = true
 	if c.conn != nil {
 		_ = c.conn.Close()
 		c.conn = nil

@@ -555,6 +555,11 @@ func serverPortsFromArgs(args []string) map[int]bool {
 // splitArg reads the flag at args[i] and returns its lowercased name, its value
 // (either after "=" or args[i+1]), whether a value was present, and the index
 // of the last argument it consumed.
+//
+// A boolean flag takes no value, so the token after it is not consumed. Without
+// that rule "-enableStats -bsPort 14001" read "-bsPort" as the value of
+// -enableStats and then skipped it, and the replay never found the port it had
+// to dial.
 func splitArg(args []string, i int) (name, value string, hasValue bool, next int) {
 	arg := args[i]
 	if arg == "-" || !strings.HasPrefix(arg, "-") {
@@ -564,10 +569,21 @@ func splitArg(args []string, i int) (name, value string, hasValue bool, next int
 	if n, v, found := strings.Cut(name, "="); found {
 		return n, v, true, i
 	}
-	if i+1 < len(args) {
+	if !isBoolFlagName(name) && i+1 < len(args) {
 		return name, args[i+1], true, i + 1
 	}
 	return name, "", false, i
+}
+
+// isBoolFlagName reports whether the flag takes no value. It mirrors the boolean
+// flags registered by internal/config.ParseFlags; splitArg works on recorded
+// command lines, where those are the original's flags and nothing else.
+func isBoolFlagName(name string) bool {
+	switch name {
+	case "allowtimeoutoverride", "enablestats", "help", "h", "?":
+		return true
+	}
+	return false
 }
 
 // chunk is one raw TCP write as the proxy logged it: a slice of the stream and
@@ -630,7 +646,14 @@ func loadLog(path string, serverPorts map[int]bool) (map[int]*Conn, []string, er
 			bad++
 			continue
 		}
-		at, _ := time.Parse(time.RFC3339, strings.TrimSpace(rec[cols.ts]))
+		at, err := time.Parse(time.RFC3339, strings.TrimSpace(rec[cols.ts]))
+		if err != nil {
+			// A row with no readable clock cannot be placed on the replay
+			// timeline. Scheduling it at zero silently moves it to the start of
+			// the match and makes the report claim a speed the capture does not
+			// support, so the capture is refused instead.
+			return nil, nil, fmt.Errorf("%s: row %d has an unparseable timestamp %q: %w", filepath.Base(path), rows, rec[cols.ts], err)
+		}
 
 		var conn *Conn
 		toServer := true
@@ -1399,10 +1422,11 @@ func Check(dir string, opts Options) (*Report, error) {
 		rep.Dirty = "unknown"
 	}
 	// The two sides of a capture are launched with their own command lines, and
-	// only the listen ports are meant to differ. When more differs, the replay is
-	// reproducing one configuration and comparing it against another, and that
-	// has to be on the report before any verdict is read.
-	rep.ConfigDiff = diffArgs(cap.Ours.Args, cap.Reference.Args)
+	// only the listen ports are meant to differ. Compare the line the replay
+	// actually used (cap.Args()) with the original's, not the "ours" side's line:
+	// when no side is identified as ours, the replay uses the other side's line
+	// and comparing a different one would report a difference nobody ran.
+	rep.ConfigDiff = diffArgs(cap.Args(), cap.Reference.Args)
 
 	cfg, dropped, err := ConfigFromArgs(cap.Args())
 	if err != nil {

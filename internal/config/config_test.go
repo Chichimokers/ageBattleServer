@@ -20,7 +20,7 @@ func TestNormalizeArgs(t *testing.T) {
 	}
 
 	args = normalizeArgs([]string{"--bsport", "27012", "-UploadVia", "lobby"})
-	want = []string{"--bsport", "27012", "-uploadvia", "lobby"}
+	want = []string{"-bsport", "27012", "-uploadvia", "lobby"}
 	if !reflect.DeepEqual(args, want) {
 		t.Errorf("normalizeArgs = %v, want %v", args, want)
 	}
@@ -47,6 +47,21 @@ func TestNormalizeArgs(t *testing.T) {
 	args = normalizeArgs(nil)
 	if args == nil || len(args) != 0 {
 		t.Errorf("normalizeArgs(nil) = %v, want empty slice", args)
+	}
+}
+
+// TestParseFlagsAcceptsDoubleDashAndDashValues covers the two command-line
+// normalizations: --Flag is the same flag as -Flag (both case-insensitive), and
+// a value that starts with "-" is a value, not the next flag.
+func TestParseFlagsAcceptsDoubleDashAndDashValues(t *testing.T) {
+	resetFlags()
+	os.Args = []string{"battleserver", "--bsPort", "23013", "-name", "-MyServer", "-uploadVia=-db"}
+	cfg := ParseFlags()
+	if cfg.BsPort != 23013 {
+		t.Errorf("--bsPort 23013 gave BsPort = %d, want 23013", cfg.BsPort)
+	}
+	if cfg.Name != "-MyServer" {
+		t.Errorf("-name -MyServer gave Name = %q, want %q", cfg.Name, "-MyServer")
 	}
 }
 

@@ -114,6 +114,9 @@ func Trim(src, dst string, opts TrimOptions) (*TrimRecord, error) {
 		return nil, fmt.Errorf("trim: parse %s: %w", metadataName, err)
 	}
 	if meta.FormatVersion == formatVersionTrimmed {
+		if meta.Trim == nil {
+			return nil, fmt.Errorf("trim: %s says format_version %d but carries no trim record, so it is refused rather than cropped", filepath.Base(src), formatVersionTrimmed)
+		}
 		return nil, fmt.Errorf("trim: %s is already trimmed (kept %s of its %s): crop the original, not a crop",
 			filepath.Base(src), meta.Trim.KeptSpan, meta.Trim.Dropped)
 	}

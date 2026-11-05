@@ -8,6 +8,7 @@ import (
 	"encoding/pem"
 	"math/big"
 	"os"
+	"path/filepath"
 	"time"
 )
 
@@ -17,6 +18,20 @@ func ensureCertFiles(certPath, keyPath string) error {
 	if _, err := os.Stat(certPath); err == nil {
 		if _, err := os.Stat(keyPath); err == nil {
 			return nil
+		}
+	}
+
+	// The default path lives under the executable's directory, which may not
+	// exist on a first run. A missing parent used to make the OpenFile fail with
+	// ENOENT and abort the capture.
+	if dir := filepath.Dir(certPath); dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return err
+		}
+	}
+	if dir := filepath.Dir(keyPath); dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return err
 		}
 	}
 

@@ -149,7 +149,22 @@ type Server struct {
 	config    *Config
 	startTime time.Time
 	running   atomic.Bool
-	mu        sync.RWMutex
+	// started records that Start ran at least once. It distinguishes the window
+	// before Start (tests build clients directly) from the window after Stop,
+	// where a late connection must be refused and closed. running is false in
+	// both.
+	started atomic.Bool
+	mu      sync.RWMutex
+	// lifecycleMu serializes Start and Stop, so a Stop that races a Start
+	// cannot leave running inverted or overwrite startCancel/loopDone from
+	// under it.
+	lifecycleMu sync.Mutex
+
+	// startCancel ends the internal context Start derives from its caller, so
+	// Stop stops every loop it started even when the caller's context is still
+	// alive. loopDone is closed by mainLoop when it returns.
+	startCancel context.CancelFunc
+	loopDone    chan struct{}
 
 	bsListener       *BsSocketListener
 	wsListener       *WsSocketListener
@@ -286,43 +301,88 @@ func (s *Server) Run(ctx context.Context) error {
 }
 
 func (s *Server) Start(ctx context.Context) error {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	if s.running.Load() {
+		return fmt.Errorf("server is already running")
+	}
+
+	runCtx, cancel := context.WithCancel(ctx)
+	s.mu.Lock()
+	s.startCancel = cancel
+	done := make(chan struct{})
+	s.loopDone = done
+	s.mu.Unlock()
+	s.started.Store(true)
 	s.running.Store(true)
 
+	// Everything started before a failure is stopped in reverse order, so a
+	// failed Start leaves no listener and no goroutine behind. A second Start
+	// after the port is freed has to find the same server it would have.
+	var started []func()
+	rollback := func() {
+		cancel()
+		for i := len(started) - 1; i >= 0; i-- {
+			started[i]()
+		}
+		s.running.Store(false)
+		// mainLoop was never started, so this is the only closer of done.
+		s.mu.Lock()
+		if s.loopDone == done {
+			s.loopDone = nil
+		}
+		s.mu.Unlock()
+		close(done)
+	}
+
 	if s.oobListener != nil {
-		if err := s.oobListener.Start(ctx); err != nil {
+		if err := s.oobListener.Start(runCtx); err != nil {
+			rollback()
 			return fmt.Errorf("ping server: %w", err)
 		}
+		started = append(started, s.oobListener.Stop)
 	}
 
 	if s.bsListener != nil {
-		if err := s.bsListener.Start(ctx); err != nil {
+		if err := s.bsListener.Start(runCtx); err != nil {
+			rollback()
 			return fmt.Errorf("bs listener: %w", err)
 		}
+		started = append(started, s.bsListener.Stop)
 	}
 
 	if s.wsListener != nil {
-		if err := s.wsListener.Start(ctx); err != nil {
+		if err := s.wsListener.Start(runCtx); err != nil {
+			rollback()
 			return fmt.Errorf("ws listener: %w", err)
 		}
+		started = append(started, s.wsListener.Stop)
 	}
 
 	if s.relayBroadcaster != nil {
-		if err := s.relayBroadcaster.Start(ctx); err != nil {
+		if err := s.relayBroadcaster.Start(runCtx); err != nil {
+			rollback()
 			return fmt.Errorf("relay broadcaster: %w", err)
 		}
+		started = append(started, s.relayBroadcaster.Stop)
 	}
 
 	if s.lobbyClient != nil {
-		if err := s.lobbyClient.Start(ctx); err != nil {
+		if err := s.lobbyClient.Start(runCtx); err != nil {
+			rollback()
 			return fmt.Errorf("lobby client: %w", err)
 		}
+		started = append(started, s.lobbyClient.Stop)
 	}
 
 	if s.muninTicker != nil {
-		go s.muninLoop(ctx)
+		go s.muninLoop(runCtx)
 	}
 
-	go s.mainLoop(ctx)
+	go func() {
+		defer close(done)
+		s.mainLoop(runCtx)
+	}()
 
 	logger.Log("Server", "Start", 3, "Battleserver %s running on ports %d,%d,%d", version, s.config.BsPort, s.config.WebSocketPort, s.config.OutOfBandPort)
 
@@ -330,7 +390,22 @@ func (s *Server) Start(ctx context.Context) error {
 }
 
 func (s *Server) Stop() error {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
 	s.running.Store(false)
+
+	// Cancel the internal context first: the component loops and the main loop
+	// all watch it, so this is what makes Stop stop the lobby reconnect loop and
+	// the munin/broadcast loops even when the caller's context stays alive.
+	s.mu.Lock()
+	cancel := s.startCancel
+	done := s.loopDone
+	s.startCancel = nil
+	s.loopDone = nil
+	s.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 
 	if s.bsListener != nil {
 		s.bsListener.Stop()
@@ -357,6 +432,14 @@ func (s *Server) Stop() error {
 	}
 	if s.muninFile != nil {
 		_ = s.muninFile.Close()
+	}
+
+	if done != nil {
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			logger.Warning("Server", "Stop", "main loop did not exit within 5s")
+		}
 	}
 
 	s.mu.Lock()
@@ -460,11 +543,19 @@ func (s *Server) collectMetrics() {
 
 func (s *Server) AddClient(c ClientConn) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	if s.started.Load() && !s.running.Load() {
+		s.mu.Unlock()
+		// The listener accepted this connection while the server was going down.
+		// It is not registered, and it is closed so it cannot linger as a socket
+		// nobody serves. Close runs outside the lock: it reaches RemoveClient.
+		_ = c.Close()
+		return
+	}
 	s.clients = append(s.clients, c)
 	s.clientSet[c] = struct{}{}
 	s.clientCount.Add(1)
 	s.metricsCollector.AddToCounter("TcpConnections", 1)
+	s.mu.Unlock()
 }
 
 // NotifyWork tells the main loop that c has queued messages to process. The
@@ -494,6 +585,7 @@ func (s *Server) NotifyWork(c ClientConn) {
 // and session locks, and nothing here needs the client list any more.
 func (s *Server) RemoveClient(c ClientConn) {
 	s.mu.Lock()
+	_, registered := s.clientSet[c]
 	for i, cli := range s.clients {
 		if cli == c {
 			s.clients[i] = s.clients[len(s.clients)-1]
@@ -502,7 +594,12 @@ func (s *Server) RemoveClient(c ClientConn) {
 		}
 	}
 	delete(s.clientSet, c)
-	s.clientCount.Add(-1)
+	// A connection AddClient refused after Stop was never counted, and its Close
+	// still reaches here. Decrement only a client that was registered, or the
+	// gauge loses a live client during shutdown.
+	if registered && s.clientCount.Load() > 0 {
+		s.clientCount.Add(-1)
+	}
 	observed := s.observerSessions[c]
 	delete(s.observerSessions, c)
 	delete(s.pingEchoBudget, c)

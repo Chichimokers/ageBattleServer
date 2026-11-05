@@ -65,7 +65,19 @@ func TestLoadRealistic(t *testing.T) {
 	rep.ServerBytesSent = counters["BytesSent"]
 
 	t.Log("\n" + loadgen.FormatReport(rep))
-	if rep.Stats.Errors > 0 {
-		t.Logf("WARNING: %d client-side errors during the run", rep.Stats.Errors)
+	// The report was advisory and the suite stayed green with every observer
+	// failing to subscribe. It is now an assertion: the load model only counts
+	// as exercised if it produced no client-side errors and every connection it
+	// asked for reached the server.
+	if rep.Stats.Errors != 0 {
+		t.Errorf("%d client-side errors during the run; the load model is not clean", rep.Stats.Errors)
+	}
+	wantConns := float64(profile.Matches * (profile.Players + profile.Observers))
+	if got := counters["WsConnections"]; got < wantConns {
+		t.Errorf("WsConnections = %.0f, want at least %.0f: %d match(es) x (%d players + %d observers)",
+			got, wantConns, profile.Matches, profile.Players, profile.Observers)
+	}
+	if rep.Stats.RecvMsgs == 0 || rep.ServerBytesReceived == 0 {
+		t.Errorf("no traffic observed: client recv=%d, server bytes received=%.0f", rep.Stats.RecvMsgs, rep.ServerBytesReceived)
 	}
 }

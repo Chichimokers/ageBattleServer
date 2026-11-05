@@ -31,6 +31,18 @@ func (s *Stats) recordRecv(n int) {
 	s.recvBytes.Add(uint64(n))
 }
 
+// recordRecvBytes counts received bytes without counting a message. A WebSocket
+// frame is one message made of a header and a payload; the header bytes are
+// traffic but not a message, and counting each read as one inflated RecvMsgs.
+func (s *Stats) recordRecvBytes(n int) {
+	s.recvBytes.Add(uint64(n))
+}
+
+// recordRecvMsg counts one complete received message.
+func (s *Stats) recordRecvMsg() {
+	s.recvMsgs.Add(1)
+}
+
 func (s *Stats) recordPing(d time.Duration) {
 	ns := uint64(d)
 	s.pingCount.Add(1)
