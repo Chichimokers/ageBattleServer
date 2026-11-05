@@ -102,16 +102,14 @@ func (m *Manager) GetSession(k SessionKey) *Session {
 }
 
 // GetOrCreateSession returns the session with the given key, creating it when it
-// does not exist yet. A non-positive sessionID gets the next generated one.
+// does not exist yet. The key is used exactly as given: session ID 0 is an
+// ordinary key, not a request for a generated one. A caller that needs a
+// generated ID asks CreateSession, so the manager never rewrites the key a
+// client sent.
 // Returns nil when a new session would exceed the concurrent session limit.
 func (m *Manager) GetOrCreateSession(k SessionKey) *Session {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-
-	if k.SessionID <= 0 {
-		k.SessionID = m.nextID
-		m.nextID++
-	}
 
 	if sess, ok := m.sessions[k]; ok {
 		return sess
@@ -191,24 +189,35 @@ func (m *Manager) SnapshotSessions(dst []*Session) []*Session {
 // is rejected instead of silently replacing that peer.
 func (m *Manager) AddPeer(sess *Session, peer *Peer) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 
 	if m.sessions[sess.key] != sess {
+		m.mu.Unlock()
 		return ErrSessionErased
 	}
+	var erased *Session
 	if prev := m.peerSession[peer.Conn]; prev != nil && prev != sess {
 		prev.RemovePeer(prev.PeerIDForConn(peer.Conn))
+		erased = m.eraseIfVacantLocked(prev)
 	}
 	if existing := sess.GetPeer(peer.ID); existing != nil {
 		if existing.Conn == peer.Conn {
 			// Idempotent re-add of the same connection: refresh the mapping.
 			m.peerSession[peer.Conn] = sess
+			m.mu.Unlock()
+			m.closeErased(erased)
 			return nil
 		}
+		m.mu.Unlock()
+		m.closeErased(erased)
 		return fmt.Errorf("session %d: peer ID %d already taken by another connection", sess.ID, peer.ID)
 	}
 	m.peerSession[peer.Conn] = sess
 	sess.AddPeer(peer)
+	m.mu.Unlock()
+	// The previous session was left with no member and no observer: close it
+	// after the manager lock is gone, because closing a connection reaches
+	// HandleDisconnect, which takes that lock again.
+	m.closeErased(erased)
 	return nil
 }
 
@@ -282,29 +291,63 @@ func (m *Manager) ReconnectPeer(sess *Session, id byte, conn PeerConnection, sec
 // before it was erased gets ErrSessionErased from AddPeer and joins the live one.
 func (m *Manager) HandleDisconnect(conn PeerConnection, observed *Session) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	var erased []*Session
 	member := m.peerSession[conn]
 	delete(m.peerSession, conn)
 	if member != nil {
 		if id := member.PeerIDForConn(conn); id != 0 {
 			member.RemovePeer(id)
 		}
-		m.eraseIfVacantLocked(member)
+		if s := m.eraseIfVacantLocked(member); s != nil {
+			erased = append(erased, s)
+		}
 	}
 	if observed != nil {
-		observed.removeObserverConn(conn)
-		m.eraseIfVacantLocked(observed)
+		observed.RemoveObserverConn(conn)
+		if s := m.eraseIfVacantLocked(observed); s != nil && (len(erased) == 0 || erased[0] != s) {
+			erased = append(erased, s)
+		}
+	}
+	m.mu.Unlock()
+	// Closing the connections reaches HandleDisconnect again, so it runs after
+	// the manager lock is released.
+	for _, s := range erased {
+		s.Close()
+	}
+}
+
+// RemoveSessionIfVacant erases sess when it has no member and no observer left.
+// It is the stop-watching path's cleanup: a session that lost its last observer
+// is vacant even though no connection is closing, and nothing else would take it
+// out of the map.
+func (m *Manager) RemoveSessionIfVacant(sess *Session) {
+	if sess == nil {
+		return
+	}
+	m.mu.Lock()
+	erased := m.eraseIfVacantLocked(sess)
+	m.mu.Unlock()
+	m.closeErased(erased)
+}
+
+// closeErased closes a session that eraseIfVacantLocked took out of the map.
+// Callers must not hold m.mu: a connection's Close reaches HandleDisconnect,
+// which takes it. nil is a no-op.
+func (m *Manager) closeErased(sess *Session) {
+	if sess != nil {
+		sess.Close()
 	}
 }
 
 // eraseIfVacantLocked erases sess from the session map when it has no member and
-// no observer left. A session that is no longer the one in the map under its key
-// is left alone. Callers must hold m.mu.
-func (m *Manager) eraseIfVacantLocked(sess *Session) {
+// no observer left, and returns it so the caller can close it once the manager
+// lock is gone. A session that is no longer the one in the map under its key is
+// left alone. Callers must hold m.mu.
+func (m *Manager) eraseIfVacantLocked(sess *Session) *Session {
 	if m.sessions[sess.key] != sess || !sess.Vacant() {
-		return
+		return nil
 	}
-	sess.Close()
 	delete(m.sessions, sess.key)
 	log.Printf("Session %d (titleID %d) removed: no member and no observer left", sess.key.SessionID, sess.key.TitleID)
+	return sess
 }

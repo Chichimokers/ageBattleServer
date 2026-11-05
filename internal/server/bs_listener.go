@@ -60,5 +60,7 @@ func (l *BsSocketListener) GetPort() int {
 	if l.listener != nil {
 		return l.listener.GetPort()
 	}
-	return int(l.port)
+	// Not started, or stopped: there is no port to dial. The configured one is
+	// not a fallback, because after Stop nothing is listening on it.
+	return 0
 }

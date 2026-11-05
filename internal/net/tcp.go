@@ -134,10 +134,12 @@ func (l *TCPListener) Stop() {
 func (l *TCPListener) GetPort() int {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if l.listener != nil {
-		return l.listener.Addr().(*net.TCPAddr).Port
+	if l.closed || l.listener == nil {
+		// A stopped listener has no port to dial even though its address is
+		// still readable from the closed socket.
+		return 0
 	}
-	return 0
+	return l.listener.Addr().(*net.TCPAddr).Port
 }
 
 func GenerateGUID() string {

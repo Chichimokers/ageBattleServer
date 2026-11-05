@@ -1329,6 +1329,15 @@ func (s *Session) removeObserverConn(conn PeerConnection) bool {
 	return false
 }
 
+// RemoveObserverConn removes every observer entry that belongs to conn. It is the
+// close path's cleanup and the StopObserve fallback: one connection is one
+// observer, so a list that carries it more than once (a repeated StartObserve)
+// must not leave the duplicates behind when the connection stops watching.
+func (s *Session) RemoveObserverConn(conn PeerConnection) {
+	for s.removeObserverConn(conn) {
+	}
+}
+
 // HasObserver reports whether an entry with this connection's peerIdentifier is
 // in the list, with the same comparator as the other two lookups.
 func (s *Session) HasObserver(client PeerConnection) bool {
@@ -1619,8 +1628,8 @@ func (s *Session) ReplayPageCount() int {
 
 func (s *Session) Close() {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.closed {
+		s.mu.Unlock()
 		return
 	}
 	s.closed = true
@@ -1628,10 +1637,19 @@ func (s *Session) Close() {
 	// the peers go one by one. Every connection is closed either way and nothing
 	// is written to the wire by this, so the order here is a fact about the walk
 	// and not about what a client sees.
+	//
+	// The list is collected under the lock and closed after releasing it: a
+	// connection's Close reaches HandleDisconnect, which takes s.mu again, and a
+	// sync.RWMutex is not reentrant.
+	peers := make([]*Peer, 0, len(s.peerOrder))
 	for _, id := range s.peerOrder {
 		if p := s.Peers[id]; p != nil {
-			_ = p.Close()
+			peers = append(peers, p)
 		}
+	}
+	s.mu.Unlock()
+	for _, p := range peers {
+		_ = p.Close()
 	}
 }
 
