@@ -1,7 +1,8 @@
 // Package main compares two server binaries on what an operator can measure from
 // the outside: how long each takes to start listening, what each costs while it
-// sits idle, what a single connection costs it, and how long its WebSocket
-// handshake takes.
+// sits idle, what a single connection costs it, how long its WebSocket handshake
+// takes, and — with -load — what it costs while internal/loadgen drives a match
+// against it.
 //
 // It is deliberately a BLACK-BOX tool. It knows a path, an argument list and a
 // port, and nothing else: it does not know which of the two binaries is the
@@ -26,6 +27,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -36,6 +38,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/luskaner/ageBattleServer/internal/loadgen"
 )
 
 // settings is one binary's run: the path, the arguments, and the two ports it
@@ -101,6 +105,26 @@ type result struct {
 	HandlesPerConn      float64 `json:"handles_per_conn"`
 	ThreadsPerConn      float64 `json:"threads_per_conn"`
 
+	// Load* are the load phase: internal/loadgen driving the binary for the
+	// window, with the process sampled while it runs. They are zero when -load
+	// was not given, and LoadWindowS says which of the two it was.
+	//
+	// LoadProcessCPU is the SERVER's own CPU over the window, read from the
+	// process, and not the generator's: the generator runs in this process and its
+	// cost is not the figure anyone is asking for. LoadSystemCPU is the whole
+	// machine's busy fraction over the same window, reported beside it for the
+	// reason every other CPU figure here is.
+	LoadWindowS      float64 `json:"load_window_s"`
+	LoadWorkingSetMB float64 `json:"load_working_set_mb"`
+	LoadCommitMB     float64 `json:"load_commit_mb"`
+	LoadProcessCPU   float64 `json:"load_process_cpu_pct"`
+	LoadSystemCPU    float64 `json:"load_system_cpu_pct"`
+	// LoadMessages is every message the generator exchanged with the server, both
+	// directions, and LoadErrors is how many of its own operations failed. A run
+	// with errors is a run whose message count is not a throughput figure.
+	LoadMessages uint64 `json:"load_messages"`
+	LoadErrors   uint64 `json:"load_errors"`
+
 	// Started and Err record whether the run happened at all.
 	Started bool `json:"started"`
 	// Unavailable lists figures this machine could not produce, each with the
@@ -122,6 +146,10 @@ func main() {
 		repeat   = flag.Int("repeat", 3, "repetitions per binary; the MEDIAN is reported, with the range beside it")
 		upgrades = flag.Int("upgrades", 5, "WebSocket handshakes per repetition; a bimodal figure cannot be summarised by repeating one sample of it")
 		asJSON   = flag.Bool("json", false, "emit JSON instead of a table")
+		load     = flag.Bool("load", false, "run internal/loadgen against each binary for the window and sample it under load")
+		loadM    = flag.Int("load-matches", 4, "concurrent sessions the load phase drives")
+		loadP    = flag.Int("load-players", 8, "players per session in the load phase, including the host")
+		loadO    = flag.Int("load-observers", 8, "observers per session in the load phase")
 	)
 	flag.Parse()
 
@@ -138,6 +166,11 @@ func main() {
 		fmt.Fprintln(os.Stderr, "benchpeer: -repeat must be at least 1")
 		os.Exit(2)
 	}
+	if *load && (*loadM < 1 || *loadP < 1 || *loadO < 0) {
+		fmt.Fprintln(os.Stderr, "benchpeer: -load needs -load-matches and -load-players of at least 1, and -load-observers of at least 0")
+		os.Exit(2)
+	}
+	spec := loadSpec{Enabled: *load, Matches: *loadM, Players: *loadP, Observers: *loadO}
 
 	// Every binary is repeated and the MEDIAN is what is reported. This is not a
 	// refinement, it is the difference between a measurement and an anecdote:
@@ -159,7 +192,7 @@ func main() {
 			run.BsPort = *basePort + 2*i
 			run.WsPort = run.BsPort + 1
 			run.Args = expand(*extra, run)
-			all = append(all, measure(run, *window, *sample, *conns, *upgrades))
+			all = append(all, measure(run, *window, *sample, *conns, *upgrades, spec))
 		}
 	}
 
@@ -230,10 +263,21 @@ func expand(tmpl string, s settings) []string {
 	return out
 }
 
+// loadSpec is the load phase's configuration. Enabled is separate from the
+// profile's own numbers so that "no load phase" and "a load phase of zero
+// matches" cannot be confused: the second is refused at the flag, and the first
+// leaves every Load* figure at zero with LoadWindowS saying so.
+type loadSpec struct {
+	Enabled   bool
+	Matches   int
+	Players   int
+	Observers int
+}
+
 // measure runs one binary through the whole sequence and never returns a figure
 // it did not take: anything that fails is reported in Err with the figure left at
 // zero, so a partial run cannot be read as a complete one.
-func measure(s settings, window, sample time.Duration, conns, upgrades int) result {
+func measure(s settings, window, sample time.Duration, conns, upgrades int, load loadSpec) result {
 	res := result{Label: s.Label, Path: s.Path, Conns: conns}
 
 	cmd := exec.Command(s.Path, s.Args...)
@@ -370,7 +414,85 @@ func measure(s settings, window, sample time.Duration, conns, upgrades int) resu
 	for _, c := range held {
 		_ = c.Close()
 	}
+
+	// 5. Load: drive the binary with internal/loadgen for the window and sample it
+	// while it runs. This is the end-to-end counterpart to the idle figures above:
+	// those say what the process costs when nobody is talking to it, and this says
+	// what it costs when a match is.
+	//
+	// The CPU figure is the SERVER's, read from its process, and not this tool's:
+	// the generator runs here and its cost is not the number anyone is asking for.
+	if load.Enabled {
+		runLoad(&res, s.WsPort, pid, window, sample, load)
+	}
 	return res
+}
+
+// runLoad drives one binary with internal/loadgen and records what it cost.
+//
+// The sampling is done from a ticker in this goroutine while the runner works in
+// another, so a slow sample cannot stretch the load: the window is the runner's
+// own duration and the samples are what happened during it. A sample that fails
+// is skipped rather than ending the run, because the process is under load and a
+// transient refusal is not a measurement failure; if every sample failed the
+// figure is reported as unavailable instead of as a zero.
+func runLoad(res *result, wsPort, pid int, window, sample time.Duration, spec loadSpec) {
+	profile := loadgen.DefaultProfile()
+	profile.Matches = spec.Matches
+	profile.Players = spec.Players
+	profile.Observers = spec.Observers
+	profile.Duration = window
+
+	runner, err := loadgen.New(fmt.Sprintf("ws://127.0.0.1:%d/", wsPort), profile)
+	if err != nil {
+		res.Note = strings.TrimSpace(res.Note + " load: " + err.Error())
+		return
+	}
+
+	cpu0 := processCPUTime(pid)
+	sys0 := systemCPUTime()
+	start := time.Now()
+
+	done := make(chan loadgen.Report, 1)
+	go func() { done <- runner.Run(context.Background()) }()
+
+	var working, commit []float64
+	ticker := time.NewTicker(sample)
+	defer ticker.Stop()
+	var rep loadgen.Report
+wait:
+	for {
+		select {
+		case rep = <-done:
+			break wait
+		case <-ticker.C:
+			c, cerr := counters(pid)
+			if cerr != nil {
+				continue
+			}
+			working = append(working, mb(c.WorkingSet))
+			commit = append(commit, mb(c.Private))
+		}
+	}
+	elapsed := time.Since(start)
+	cpu1 := processCPUTime(pid)
+	sys1 := systemCPUTime()
+
+	res.LoadWindowS = elapsed.Seconds()
+	res.LoadMessages = rep.Stats.SentMsgs + rep.Stats.RecvMsgs
+	res.LoadErrors = rep.Stats.Errors
+	if len(working) == 0 {
+		res.Unavailable = append(res.Unavailable, "load working set and commit charge: no sample of the process succeeded during the load window")
+	} else {
+		res.LoadWorkingSetMB = median(working)
+		res.LoadCommitMB = median(commit)
+	}
+	if total := sys1.total - sys0.total; total > 0 {
+		res.LoadProcessCPU = 100 * float64(cpu1-cpu0) / float64(total)
+		res.LoadSystemCPU = 100 * (1 - float64(sys1.idle-sys0.idle)/float64(total))
+	} else {
+		res.Unavailable = append(res.Unavailable, "load CPU: the system clock did not advance over the load window")
+	}
 }
 
 // waitPort returns the instant the port first accepted a connection.
@@ -507,6 +629,13 @@ func summarise(rs []result, repeat int) []summary {
 		"commitPerConn":  func(r result) float64 { return r.PrivateMBPerConn },
 		"handlesPerConn": func(r result) float64 { return r.HandlesPerConn },
 		"threadsPerConn": func(r result) float64 { return r.ThreadsPerConn },
+		"loadWindow":     func(r result) float64 { return r.LoadWindowS },
+		"loadWS":         func(r result) float64 { return r.LoadWorkingSetMB },
+		"loadCommit":     func(r result) float64 { return r.LoadCommitMB },
+		"loadCPU":        func(r result) float64 { return r.LoadProcessCPU },
+		"loadSystemCPU":  func(r result) float64 { return r.LoadSystemCPU },
+		"loadMessages":   func(r result) float64 { return float64(r.LoadMessages) },
+		"loadErrors":     func(r result) float64 { return float64(r.LoadErrors) },
 	}
 	out := make([]summary, 0, len(order))
 	for _, label := range order {
@@ -592,6 +721,14 @@ func printTable(rs []summary) {
 		{"commit per conn (MB)", "commitPerConn"},
 		{"handles per conn", "handlesPerConn"},
 		{"threads per conn", "threadsPerConn"},
+		{"--- under load (-load) ---", ""},
+		{"load window (s)", "loadWindow"},
+		{"load working set (MB)", "loadWS"},
+		{"load commit charge (MB)", "loadCommit"},
+		{"load process CPU (% of machine)", "loadCPU"},
+		{"system CPU under load (%)", "loadSystemCPU"},
+		{"load messages (both directions)", "loadMessages"},
+		{"load errors", "loadErrors"},
 	}
 	head := fmt.Sprintf("%-34s", "MEDIAN of N repetitions")
 	for _, r := range rs {
