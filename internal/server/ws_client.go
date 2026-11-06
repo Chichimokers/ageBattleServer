@@ -30,9 +30,32 @@ type WsClient struct {
 	clientMessageVersion uint16
 	observerSkip         uint32
 	skipMS               uint32
-	pinged               bool
-	closed               bool
-	observer             bool
+	// pinged is set by the first replay-data upload and read on every upload, and
+	// observer is read on every dispatch and every upload. Both are atomics rather
+	// than fields behind mu: they were two lock acquisitions per message on the
+	// busiest path in a real match.
+	pinged   atomic.Bool
+	observer atomic.Bool
+	closed   bool
+	// sendQueue is the outbound FIFO, guarded by mu. queuedBytes counts its bytes
+	// plus those of the batch the writer is still writing.
+	sendQueue   []wsOutbound
+	queuedBytes int
+	// sendSignal wakes the writer; one pending signal covers any number of queued
+	// frames.
+	sendSignal chan struct{}
+	// closeCh is closed when the socket is closed, which ends the writer.
+	closeCh chan struct{}
+	// maxQueuedBytes is maxQueuedSendBytes; a test lowers it.
+	maxQueuedBytes int
+	// started is set once the writer goroutine is running. A client built by hand
+	// (the tests that drive Process without a socket) has no writer, so its close
+	// has nothing to drain.
+	started bool
+	// draining is a server-side close waiting for the writer to deliver the queue.
+	draining bool
+	// socketClosed is set once the socket itself is closed.
+	socketClosed bool
 	// dispatchMu serializes Process and Close. A Close that arrives while a
 	// handler is being dispatched cannot take it (the handler may be the one
 	// asking for the close, as StopObserve is), so it sets closePending and
@@ -60,45 +83,52 @@ var wsFramePool = sync.Pool{
 }
 
 // wsSendPool reuses the per-message [type][body] buffers built in SendMessage.
-// Unlike the incoming frames, these are written synchronously by Send (gws
-// WriteMessage), so they are returned right after.
+// The writer returns them once it has written them, so a frame lives in the
+// outbound queue for as long as the peer takes to read it.
 var wsSendPool = sync.Pool{
 	New: func() any { return make([]byte, 0, 64) },
 }
 
+// wsOutbound is one queued write. pooled marks frames built by SendMessage from
+// wsSendPool: the writer returns those to the pool once written, while plain Send
+// payloads are owned by the caller and must not be pooled.
+type wsOutbound struct {
+	data   []byte
+	pooled bool
+}
+
 func NewWsClient(conn *gws.Conn, host ClientHost, counter metricsCounter, observerSkip uint32) *WsClient {
 	wc := &WsClient{
-		conn:     conn,
-		host:     host,
-		counter:  counter,
-		lastSeen: time.Now(),
-		lastPing: time.Now(),
-		skipMS:   observerSkip,
+		conn:           conn,
+		host:           host,
+		counter:        counter,
+		lastSeen:       time.Now(),
+		lastPing:       time.Now(),
+		skipMS:         observerSkip,
+		sendSignal:     make(chan struct{}, 1),
+		closeCh:        make(chan struct{}),
+		maxQueuedBytes: maxQueuedSendBytes,
+		started:        true,
 	}
 	host.AddClient(wc)
+	go wc.writeLoop()
 	return wc
 }
 
-// Send writes bytes verbatim to the socket as one WebSocket binary frame, for
-// every client including observers. Every outbound send is framed for the
-// connection's own transport, and the per-peer send used by the observer update
+// Send queues bytes to be written verbatim to the socket as one WebSocket binary
+// frame, for every client including observers. Every outbound send is framed for
+// the connection's own transport, and the per-peer send used by the observer update
 // asks for exactly that framing. The same framing applies to the out-of-band
 // echo on a port that is WebSocket over TLS. An observer is therefore not a raw
 // stream: this used to bypass the WebSocket layer and prepend a [u16 BE length],
 // which was a guess with no capture behind it, and the guess was wrong.
+//
+// The bytes are QUEUED, not written: Send returns as soon as the frame is in the
+// queue, and the caller must not reuse data afterwards. That is the whole point of
+// the queue -- a peer that stops reading must not be able to stall the caller, and
+// the caller is the main loop.
 func (c *WsClient) Send(data []byte) error {
-	c.mu.Lock()
-	if c.closed {
-		c.mu.Unlock()
-		return errors.New("client closed")
-	}
-	c.mu.Unlock()
-
-	if err := c.conn.WriteMessage(gws.OpcodeBinary, data); err != nil {
-		return err
-	}
-	c.counter.AddToCounter("BytesSent", float64(len(data)))
-	return nil
+	return c.enqueueSend(wsOutbound{data: data})
 }
 
 func (c *WsClient) SendMessage(msgType byte, body []byte) error {
@@ -108,11 +138,146 @@ func (c *WsClient) SendMessage(msgType byte, body []byte) error {
 	msg := wsSendPool.Get().([]byte)
 	msg = append(msg[:0], msgType)
 	msg = append(msg, body...)
-	err := c.Send(msg)
-	wsSendPool.Put(msg)
-	return err
+	if err := c.enqueueSend(wsOutbound{data: msg, pooled: true}); err != nil {
+		wsSendPool.Put(msg)
+		return err
+	}
+	return nil
 }
 
+// enqueueSend appends m to the outbound queue and wakes the writer. It never waits
+// and never drops a frame on an open connection: while the peer reads slowly the
+// queue grows, up to maxQueuedBytes. The send that would cross that cap closes the
+// connection instead, with a log line, and is refused.
+func (c *WsClient) enqueueSend(m wsOutbound) error {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return errors.New("client closed")
+	}
+	limit := c.maxQueuedBytes
+	if limit <= 0 {
+		// A client built by hand in a test has no limit set; the cap is the
+		// package's, not zero, because a zero cap would refuse every send.
+		limit = maxQueuedSendBytes
+	}
+	if c.queuedBytes+len(m.data) > limit {
+		queued := c.queuedBytes
+		first := c.abortLocked()
+		c.mu.Unlock()
+		logger.Warning("WsTransport", "send", "closing connection, %d bytes queued and the peer is not reading them from=%s",
+			queued, c.RemoteAddr())
+		// A send can come from a goroutine that holds a session lock (the 0x0A
+		// broadcast, the observer step), and RemoveClient takes that lock again,
+		// so the removal runs on its own goroutine.
+		if first {
+			go c.host.RemoveClient(c)
+		}
+		return errors.New("send queue full")
+	}
+	c.sendQueue = append(c.sendQueue, m)
+	c.queuedBytes += len(m.data)
+	c.mu.Unlock()
+
+	select {
+	case c.sendSignal <- struct{}{}:
+	default:
+	}
+	return nil
+}
+
+// writeLoop moves the outbound queue to the socket in FIFO order, one batch per
+// wake-up. It ends when the socket closes, or after it has written the last batch
+// of a server-side close, which it closes itself.
+//
+// This goroutine is what keeps the main loop out of the socket: gws's WriteMessage
+// blocks for as long as the peer's receive window is full, and before this existed
+// that block was the main loop's.
+func (c *WsClient) writeLoop() {
+	var batch []wsOutbound
+	for {
+		select {
+		case <-c.sendSignal:
+		case <-c.closeCh:
+			return
+		}
+
+		c.mu.Lock()
+		batch, c.sendQueue = c.sendQueue, batch[:0]
+		batchBytes := c.queuedBytes
+		last := c.draining
+		c.mu.Unlock()
+
+		err := c.writeBatch(batch)
+		clear(batch)
+		c.mu.Lock()
+		c.queuedBytes -= batchBytes
+		if c.queuedBytes < 0 {
+			// abortLocked zeroed the counter while this batch was in flight, so the
+			// subtraction can go below zero. The connection is closed and the counter
+			// is not read again, but a negative queued-bytes is not a number any
+			// reader should have to reason about.
+			c.queuedBytes = 0
+		}
+		c.mu.Unlock()
+		if err != nil {
+			c.writeFailed(err)
+			return
+		}
+		if last {
+			// Everything queued before the close has been written: send the close
+			// frame and finish. A frame cannot have been queued after it, see
+			// enqueueSend.
+			if c.conn != nil {
+				_ = c.conn.WriteClose(1000, nil)
+			}
+			c.abort()
+			return
+		}
+	}
+}
+
+// writeBatch writes the frames in order. Pooled frames go back to the pool once
+// written, and the ones left unwritten go back too: a failed write ends the
+// connection, so nothing else can be holding them.
+func (c *WsClient) writeBatch(batch []wsOutbound) error {
+	for i, m := range batch {
+		if err := c.conn.WriteMessage(gws.OpcodeBinary, m.data); err != nil {
+			for _, rest := range batch[i:] {
+				if rest.pooled {
+					wsSendPool.Put(rest.data)
+				}
+			}
+			return err
+		}
+		c.counter.AddToCounter("BytesSent", float64(len(m.data)))
+		if m.pooled {
+			wsSendPool.Put(m.data)
+		}
+	}
+	return nil
+}
+
+// writeFailed handles a write that returned an error. The peer's stream is then at
+// an unknown offset and no later frame could be delivered in order, so the
+// connection closes at once. A write that fails because the socket is already
+// closed needs no log line; any other is logged with its cause.
+func (c *WsClient) writeFailed(err error) {
+	c.mu.Lock()
+	gone := c.socketClosed
+	c.mu.Unlock()
+	if !gone {
+		logger.Warning("WsTransport", "send", "closing connection, write failed: %v from=%s", err, c.RemoteAddr())
+	}
+	c.abort()
+}
+
+// Close is a server-side close. The connection takes no new frame from here on
+// and leaves the host at once, but every frame queued before the call still
+// reaches the peer: the writer delivers the queue, sends the close frame and then
+// closes the socket. The delivery gets closeDrainTimeout; a peer that has not
+// taken the queue by then is cut off. A client with no writer (one built by hand
+// in a test) closes at once.
 func (c *WsClient) Close() error {
 	// A handler being dispatched may be the caller (StopObserve closes its own
 	// connection). Taking dispatchMu there would deadlock, so the close is
@@ -135,6 +300,14 @@ func (c *WsClient) Close() error {
 		return nil
 	}
 	c.closed = true
+	if c.started {
+		c.draining = true
+		if c.conn != nil {
+			_ = c.conn.SetWriteDeadline(time.Now().Add(closeDrainTimeout))
+		}
+	} else {
+		c.closeSocketLocked()
+	}
 	c.mu.Unlock()
 	c.dispatchMu.Unlock()
 
@@ -144,10 +317,68 @@ func (c *WsClient) Close() error {
 	c.dropIncoming()
 
 	c.host.RemoveClient(c)
-	if c.conn != nil {
-		_ = c.conn.WriteClose(1000, nil)
+	select {
+	case c.sendSignal <- struct{}{}:
+	default:
 	}
 	return nil
+}
+
+// abort closes the connection at once and drops whatever is still queued. It is
+// the close for a connection nothing can or need be delivered to: the peer closed
+// or its stream broke, a write failed, the queue overflowed, or a server-side
+// close finished delivering.
+func (c *WsClient) abort() {
+	c.mu.Lock()
+	first := c.abortLocked()
+	c.mu.Unlock()
+
+	c.dropIncoming()
+	if first {
+		c.host.RemoveClient(c)
+	}
+}
+
+// abortLocked closes the socket and drops the queue, and reports whether this
+// call closed the connection, in which case the caller removes it from the host.
+// Callers must hold c.mu.
+func (c *WsClient) abortLocked() bool {
+	wasClosed := c.closed
+	c.closed = true
+	c.draining = false
+	c.closeSocketLocked()
+	// The queued frames are not going to be written: the socket is closed. The
+	// ones SendMessage built come from wsSendPool, so they go back to it instead
+	// of being left to the collector. A plain Send payload is owned by its caller
+	// and must not be pooled.
+	for _, m := range c.sendQueue {
+		if m.pooled {
+			wsSendPool.Put(m.data)
+		}
+	}
+	c.sendQueue = nil
+	c.queuedBytes = 0
+	return !wasClosed
+}
+
+// closeSocketLocked closes the socket once. Callers must hold c.mu.
+//
+// It closes the socket itself and not through gws's WriteClose, and that is the
+// difference between a close that returns and one that waits: WriteClose takes
+// gws's write lock, which a write already in flight on a stalled peer holds.
+// Closing the socket unblocks that write instead of queueing behind it. The
+// graceful path sends the close frame from the writer, before it gets here.
+func (c *WsClient) closeSocketLocked() {
+	if c.socketClosed {
+		return
+	}
+	c.socketClosed = true
+	if c.closeCh != nil {
+		close(c.closeCh)
+	}
+	if c.conn != nil {
+		_ = c.conn.NetConn().Close()
+	}
 }
 
 // dropIncoming discards every queued frame and returns its buffer to the pool.
@@ -218,7 +449,7 @@ func (c *WsClient) Process(maxPackets int, now time.Time) {
 	// gates only idle clients: pending data is processed immediately, so under
 	// event-driven processing (P1) the skip only affects the coarse safety-net
 	// polling.
-	if c.observer && c.skipMS > 0 && len(c.incoming) == 0 {
+	if c.observer.Load() && c.skipMS > 0 && len(c.incoming) == 0 {
 		c.observerSkip++
 		if c.observerSkip < c.skipMS {
 			c.mu.Unlock()
@@ -339,17 +570,13 @@ func (c *WsClient) enqueue(data []byte) {
 }
 
 func (c *WsClient) SetObserver(v bool) {
+	c.observer.Store(v)
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.observer = v
 	c.observerSkip = 0
+	c.mu.Unlock()
 }
 
-func (c *WsClient) IsObserver() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.observer
-}
+func (c *WsClient) IsObserver() bool { return c.observer.Load() }
 
 // SetPeerIdentifier stores the connection's observer identity. Every connection
 // starts at 0 and the StartObserve request overwrites it; on this transport it is
@@ -382,17 +609,9 @@ func (c *WsClient) touch() {
 	c.mu.Unlock()
 }
 
-func (c *WsClient) pingStarted() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.pinged
-}
+func (c *WsClient) pingStarted() bool { return c.pinged.Load() }
 
-func (c *WsClient) setPingStarted() {
-	c.mu.Lock()
-	c.pinged = true
-	c.mu.Unlock()
-}
+func (c *WsClient) setPingStarted() { c.pinged.Store(true) }
 
 func (c *WsClient) lobbyPingTick(now time.Time, counter uint32) {
 	c.mu.Lock()

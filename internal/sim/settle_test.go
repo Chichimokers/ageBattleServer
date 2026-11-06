@@ -55,7 +55,7 @@ func TestTheSettleCoversTheObserverStep(t *testing.T) {
 				ticks = 1
 			}
 			want := time.Duration(ticks+2) * simPeriod(cfg)
-			got := settleFor(cfg, Options{})
+			got := settleFor(cfg, Options{}, true)
 			if got < want {
 				t.Fatalf("settle = %s, but an observer activated at the end of the recording "+
 					"waits up to %d ticks (%s) for the step's first visit and the write happens on "+
@@ -73,7 +73,7 @@ func TestTheSettleCoversTheObserverStep(t *testing.T) {
 // the gap is visible rather than silent: observerStepPeriod reports what it would take.
 func TestTheSettleStaysInsideTheCeiling(t *testing.T) {
 	cfg := &server.Config{SimulationPeriod: 12500, ObserverUpdateIntervalSet: false}
-	if got := settleFor(cfg, Options{}); got != 3*time.Second {
+	if got := settleFor(cfg, Options{}, true); got != 3*time.Second {
 		t.Fatalf("settle = %s, want the 3s ceiling", got)
 	}
 	want := observerStepPeriod(cfg) * simPeriod(cfg)
@@ -87,8 +87,32 @@ func TestTheSettleStaysInsideTheCeiling(t *testing.T) {
 // overruling it: a test that wants to see the truncation has to be able to produce it.
 func TestAnExplicitSettleWinsOverTheStepFloor(t *testing.T) {
 	cfg := &server.Config{SimulationPeriod: 125}
-	if got := settleFor(cfg, Options{Settle: 100 * time.Millisecond}); got != 100*time.Millisecond {
+	if got := settleFor(cfg, Options{Settle: 100 * time.Millisecond}, true); got != 100*time.Millisecond {
 		t.Fatalf("settle = %s, want the 100ms the caller asked for", got)
+	}
+}
+
+// TestTheSettleSkipsTheObserverStepWithoutAnObserver: the observer step's period is
+// waited for because an observer activated at the end of the recording has to be
+// served, and a capture with no observer has no step to wait for. The settle is then
+// the tick ack's own three periods, floored at 400 ms, which is what it was before the
+// step's period became part of it.
+//
+// The two committed captures this is about are 2026-09-28_205830 (original at the
+// front, no observer) and 2026-09-30_201122 (bsPort, no observer). The rule is keyed on
+// whether the capture has an observer and not on its name, so a capture added later
+// gets the right settle without anyone remembering to list it.
+func TestTheSettleSkipsTheObserverStepWithoutAnObserver(t *testing.T) {
+	cfg := &server.Config{SimulationPeriod: 125}
+	withObserver := settleFor(cfg, Options{}, true)
+	without := settleFor(cfg, Options{}, false)
+	if without != 400*time.Millisecond {
+		t.Fatalf("settle with no observer = %s, want the 400 ms floor: the tick ack needs three periods "+
+			"(%s) and the floor is above that", without, 3*simPeriod(cfg))
+	}
+	if withObserver <= without {
+		t.Fatalf("settle with an observer = %s and without = %s: the observer step's period has to be the "+
+			"difference, or this rule is not the one being tested", withObserver, without)
 	}
 }
 
@@ -208,16 +232,18 @@ func TestLastTruthMomentSeesBothDirections(t *testing.T) {
 	}
 }
 
-// TestTheSettleIsExplainedInTheReport reads the report's own words. The settle is
-// now longer than three ticks, so a reader who sees the replay reading on for 1,25 s
-// past the last captured input has to be able to find out that this is the observer
-// step's period and not a fudge. The deviation that says so is the only place that
-// number is justified outside a test, and a report without it is a harness change
-// nobody can audit.
+// TestTheSettleIsExplainedInTheReport reads the report's own words. A reader who
+// sees the replay reading on past the last captured input has to be able to find
+// out why, and the deviation that says so is the only place that number is
+// justified outside a test: a report without it is a harness change nobody can
+// audit.
 //
 // It replays the whole 48 s of a real capture, so it is gated by the same rule every
-// generated capture test is (short.go). What it adds is that Check wires the deviation
-// up, and that needs the capture.
+// generated capture test is (short.go). What it adds is that Check wires the
+// deviation up, and that needs the capture. This capture has no observer, so the
+// settle it reports is the one settleForTruth widened to reach the end of the
+// recording's last whole second; the observer step's own deviation is covered by
+// TestTheObserverStepDeviationExplainsTheSettleItSets, which needs no replay.
 func TestTheSettleIsExplainedInTheReport(t *testing.T) {
 	if skipLongCapture(t, "testdata/2026-09-30_201122_c4e7c284ff1c") {
 		return
@@ -237,13 +263,40 @@ func TestTheSettleIsExplainedInTheReport(t *testing.T) {
 			"the settle has to be accounted for in the list of what the harness did not reproduce")
 	}
 	joined := strings.Join(whys, "\n")
-	if !strings.Contains(joined, "interval+1 ticks") || !strings.Contains(joined, "phase") {
-		t.Fatalf("no settle deviation explains the observer step's period, and that is what sets it: %q", joined)
+	if !strings.Contains(joined, "whole seconds") || !strings.Contains(joined, "same span") {
+		t.Fatalf("no settle deviation explains why the replay reads past the last input: %q", joined)
 	}
 	// The settled window must be the one the tail rule reads, or the split by the
 	// window is still the old one.
 	if rep.window.End-rep.window.Start < time.Second {
 		t.Fatalf("the window the tail rule splits on is %s wide, so the tail split reads a shorter span than the recording holds",
 			rep.window.End-rep.window.Start)
+	}
+}
+
+// TestTheObserverStepDeviationExplainsTheSettleItSets is the other half: when the
+// settle IS the observer step's period, the report has to say so with the
+// arithmetic, because 1,25 s of reading past the last input is otherwise
+// indistinguishable from a fudge. No capture is replayed: the deviation is a
+// function of the configuration and the settle.
+func TestTheObserverStepDeviationExplainsTheSettleItSets(t *testing.T) {
+	cfg := &server.Config{SimulationPeriod: 125}
+	settle := settleFor(cfg, Options{}, true)
+	d, ok := settleStepDeviation(cfg, settle)
+	if !ok {
+		t.Fatalf("a settle of %s set by the observer step's period (%s) has no deviation explaining it",
+			settle, observerStepPeriod(cfg)*simPeriod(cfg))
+	}
+	if d.Field != "settle window" || d.Running != settle.String() {
+		t.Fatalf("deviation = %+v, want the settle window at %s", d, settle)
+	}
+	if !strings.Contains(d.Why, "interval+1 ticks") || !strings.Contains(d.Why, "phase") {
+		t.Fatalf("the deviation does not explain the observer step's period: %q", d.Why)
+	}
+	// And it must not claim a settle the step did not set: a settle shorter than the
+	// step's period is the tick ack's, and explaining it as the step's would be a
+	// report that justifies a number it did not use.
+	if _, ok := settleStepDeviation(cfg, 400*time.Millisecond); ok {
+		t.Fatal("a settle shorter than the step's period is not the step's, and must not be explained as it")
 	}
 }

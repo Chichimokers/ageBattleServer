@@ -70,6 +70,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1153,7 +1154,7 @@ func wsPayload(frame []byte) []byte {
 //
 // The two os.Exit paths ParseFlags can still take are the help flags and the
 // usage check on -simulationPeriod 0 together with an observer interval flag
-// (config.go:120-142). Both are checked here, and both mean the recorded command
+// (config.go:125-127 and :161-163). Both are checked here, and both mean the recorded command
 // line never produced a running server, so they are refused rather than
 // reproduced.
 func ConfigFromArgs(args []string) (*server.Config, []string, error) {
@@ -1211,10 +1212,19 @@ func ConfigFromArgs(args []string) (*server.Config, []string, error) {
 	return cfg, dropped, nil
 }
 
+// flagSetMu serializes the process-global swap withFlagSet makes. The generated
+// tests run in parallel (they call t.Parallel), and flag.CommandLine and os.Args
+// are process-wide: two captures parsing their command lines at the same time
+// would read each other's flags. Parsing is microseconds, so serializing it costs
+// nothing next to the replay it precedes.
+var flagSetMu sync.Mutex
+
 // withFlagSet swaps in a fresh FlagSet and a synthetic os.Args, calls fn, and
 // puts both back. ParseFlags reads them as globals, so nothing else can be done
 // about it, and leaving them changed would leak into the rest of the test binary.
 func withFlagSet(kind flag.ErrorHandling, args []string, fn func() error) error {
+	flagSetMu.Lock()
+	defer flagSetMu.Unlock()
 	oldFlags := flag.CommandLine
 	oldArgs := os.Args
 	fs := flag.NewFlagSet("battleserver", kind)

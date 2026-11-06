@@ -1,0 +1,91 @@
+name: CI
+
+# Two gates, because the suite has two costs.
+#
+# The SHORT loop is what every change runs: it skips the real-time capture
+# replays (internal/sim's long tests, gated on -short) and finishes in about 45 s,
+# so it can be a per-change gate. It also runs the two tests that assert the
+# figures this project's performance work is measured by, because a change that
+# moves them is a change that has to say so in its own diff:
+#
+#   TestTickCostAtEveryPeerCount        allocs/tick and B/tick at every peer count
+#   TestLongMatchMemoryAndCostAreBounded the same over a long match
+#
+# The FULL suite replays all seven fixtures in real time and takes about 340 s
+# with the replays running concurrently (W7a). It is nightly and on demand, not
+# per change: it is the gate that says the wire did not move, and it is too slow
+# to sit in front of every push.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # Nightly, 03:17 UTC. Not on the hour: every scheduled job in the world is on
+    # the hour, and the runner pool is busiest then.
+    - cron: "17 3 * * *"
+
+permissions:
+  contents: read
+
+env:
+  GOTOOLCHAIN: go1.27.3
+
+jobs:
+  short:
+    name: Short loop
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: "1.27.3"
+          cache: true
+
+      - name: Build
+        run: CGO_ENABLED=0 go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Short tests
+        run: go test -short ./... -count=1
+
+      - name: The generated capture tests are in date
+        # cmd/gensim writes one sim_*_test.go per capture in testdata, and a
+        # capture added without regenerating them is a capture the suite does not
+        # replay. The comparison normalises CRLF, so this passes on a Windows
+        # checkout as well as here.
+        run: go run ./cmd/gensim -check internal/sim/testdata
+
+      - name: The tick's cost
+        run: go test ./internal/session -run 'TestTickCostAtEveryPeerCount|TestLongMatchMemoryAndCostAreBounded' -count=1 -v
+
+  full:
+    name: Full suite
+    # Nightly and on demand only. A pull request gets the short loop; the full
+    # suite is what a merge is checked against the next morning.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: "1.27.3"
+          cache: true
+
+      - name: Full suite
+        # -timeout 25m is the suite's own ceiling, below the job's 30, so a hung
+        # test reports which one hung instead of the job being killed.
+        #
+        # This is also the wire gate: internal/sim replays all seven fixtures and
+        # fails on any MUST-MATCH divergence, so a green run here is the statement
+        # that no wire byte moved.
+        run: go test ./... -count=1 -timeout 25m

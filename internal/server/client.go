@@ -51,7 +51,6 @@ type Client struct {
 	counter  metricsCounter
 	reader   *bufio.Reader
 	writer   *bufio.Writer
-	peers    map[byte]*sessionPeer
 	// sendQueue is the outbound FIFO, guarded by mu. queuedBytes counts its bytes
 	// plus those of the batch the writer is still writing.
 	sendQueue   []outboundMsg
@@ -86,16 +85,15 @@ type Client struct {
 	// socketClosed is set once the socket itself is closed.
 	socketClosed bool
 	started      bool
-	pinged       bool
+	// pinged is set by the first replay-data upload and read on every upload, so
+	// it is an atomic rather than a field behind mu: the two reads per message
+	// were two lock acquisitions on the busiest path in a real match.
+	pinged atomic.Bool
 	// peerIdentifier is the connection's observer identity, the u64 the observer
 	// list is keyed on (session.PeerConnection). Atomic because the
 	// session writes it from the message loop while the connection is also
 	// touched from the socket reader.
 	peerIdentifier atomic.Uint64
-}
-
-type sessionPeer struct {
-	id byte
 }
 
 // outboundMsg is one queued write. pooled marks frames built by SendMessage
@@ -120,7 +118,6 @@ func NewClient(conn net.Conn, host ClientHost) *Client {
 		host:           host,
 		reader:         bufio.NewReader(conn),
 		writer:         bufio.NewWriter(conn),
-		peers:          make(map[byte]*sessionPeer),
 		sendSignal:     make(chan struct{}, 1),
 		closeCh:        make(chan struct{}),
 		lastSeen:       time.Now(),
@@ -386,15 +383,11 @@ func (c *Client) handleMessage(msgType byte, body []byte) {
 }
 
 func (c *Client) pingStarted() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.pinged
+	return c.pinged.Load()
 }
 
 func (c *Client) setPingStarted() {
-	c.mu.Lock()
-	c.pinged = true
-	c.mu.Unlock()
+	c.pinged.Store(true)
 }
 
 // lobbyPingTick sends the server's own LobbyPing (0x14) keepalive at most

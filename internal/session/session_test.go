@@ -859,6 +859,34 @@ func TestSessionSyncTimeoutSparesPeerWithQueuedData(t *testing.T) {
 	}
 }
 
+// The sync-timeout answer comes out of the walk PopAckTick already made, and that
+// walk runs BEFORE the drain. So a peer whose queue empties in this tick's drain
+// is still seen holding data by this tick's check, and is reaped on the NEXT one:
+// one tick (125 ms) later than the live check it replaced. This pins that
+// ordering, which is the price of not walking the peers twice a tick.
+func TestSessionSyncTimeoutReapsOneTickAfterTheQueueEmpties(t *testing.T) {
+	s := NewSession(1)
+	s.AddPeer(NewPeer(1, &mockConn{}))
+	s.SetPeerTimeoutOverride(1, 1) // 1 ms, so the deadline is already past
+	s.QueueGameData(1, []byte{0x01, 0x02, 0x03})
+	time.Sleep(5 * time.Millisecond)
+
+	// This tick's walk sees the queue still holding the sub, so the peer is
+	// spared even though its deadline has passed.
+	s.PopAckTick()
+	s.Tick()
+	if _, _, ok := s.GetPeer(1).CloseDeadline(); ok {
+		t.Fatal("the peer must not be reaped on the tick whose walk saw its queue non-empty")
+	}
+
+	// The next tick's walk sees the drained queue and reaps it.
+	s.PopAckTick()
+	s.Tick()
+	if _, reason, ok := s.GetPeer(1).CloseDeadline(); !ok || reason != syncDataTimeoutReason {
+		t.Fatalf("the peer must be reaped on the next tick, got ok=%v reason=%q", ok, reason)
+	}
+}
+
 func TestSessionSyncTimeoutReapsSilentPeer(t *testing.T) {
 	s := NewSession(1)
 	conn := &mockConn{}

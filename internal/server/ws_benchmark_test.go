@@ -58,18 +58,47 @@ func dialWSBench(b *testing.B, port int, h *benchWSHandler) *gws.Conn {
 	}
 }
 
-// BenchmarkWSPingRoundTrip measures one full WS client->server->client ping
-// round trip. The reply is only dispatched inside WsClient.Process, which is
-// the mainLoop-driven path P1 replaces: with the 1ms ticker each round trip
-// includes the wait for the next tick; with event-driven processing it should
-// drop to the raw network/dispatch latency.
+// joinSessionBench puts the connection into a session, which is what makes the
+// 0x14 echo unconditional. A connection with no session is answered only while
+// its 100-echo budget lasts (handleLobbyPing), so a benchmark that pinged without
+// joining would stop being answered partway through and time out.
+//
+// The LobbyConnect's own reply is drained here, before the timer starts, so the
+// benchmark's channel holds only the echoes it is measuring.
+func joinSessionBench(b *testing.B, conn *gws.Conn, h *benchWSHandler) {
+	b.Helper()
+	connect := protocol.BuildLobbyConnect(0, 1, 0x0123456789abcdef, 0, 0, 5, 0, 0)
+	if err := conn.WriteMessage(gws.OpcodeBinary, wsMessage(protocol.MsgLobbyConnect, connect)); err != nil {
+		b.Fatalf("lobby connect: %v", err)
+	}
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case got := <-h.frames:
+			if typ, _ := frameType(got); typ == protocol.MsgLobbyConnect {
+				return
+			}
+		case <-deadline:
+			b.Fatal("timeout waiting for the LobbyConnect reply")
+		}
+	}
+}
+
+// BenchmarkWSPingRoundTrip measures one full WS client->server->client round trip
+// on the message the dispatcher actually echoes.
+//
+// It used to send 0x11 and wait for an echo the dispatcher does not implement, so
+// it could only ever time out: a red benchmark in the tree is a false signal. 0x14
+// is the echoed message (handleLobbyPing), and the connection joins a session
+// first so the echo is unconditional rather than budgeted.
 func BenchmarkWSPingRoundTrip(b *testing.B) {
 	_, port := startWSServerBench(b)
 	h := &benchWSHandler{frames: make(chan []byte, 64)}
 	conn := dialWSBench(b, port, h)
 	defer func() { _ = conn.WriteClose(1000, nil) }()
+	joinSessionBench(b, conn, h)
 
-	frame := wsMessage(protocol.MsgPing, nil)
+	frame := wsMessage(protocol.MsgLobbyPing, nil)
 
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -79,27 +108,27 @@ func BenchmarkWSPingRoundTrip(b *testing.B) {
 		}
 		select {
 		case got := <-h.frames:
-			if typ, _ := frameType(got); typ != protocol.MsgPing {
+			if typ, _ := frameType(got); typ != protocol.MsgLobbyPing {
 				b.Fatalf("unexpected reply type 0x%02x", typ)
 			}
 		case <-time.After(2 * time.Second):
-			b.Fatal("timeout waiting for WS ping reply")
+			b.Fatal("timeout waiting for the WS ping reply")
 		}
 	}
 	b.StopTimer()
 }
 
-// BenchmarkWSPingBurst measures the cost of draining a burst of N pings: it
-// sends the whole batch first, then waits for all replies. This shows how the
-// 1ms tick batches replies (poll) versus how event-driven processing drains
-// them as they arrive.
+// BenchmarkWSPingBurst measures the cost of draining a burst of N pings: it sends
+// the whole batch first, then waits for all the replies. That is the shape that
+// shows how the main loop batches them, which one-at-a-time cannot.
 func BenchmarkWSPingBurst(b *testing.B) {
 	_, port := startWSServerBench(b)
 	h := &benchWSHandler{frames: make(chan []byte, 1024)}
 	conn := dialWSBench(b, port, h)
 	defer func() { _ = conn.WriteClose(1000, nil) }()
+	joinSessionBench(b, conn, h)
 
-	frame := wsMessage(protocol.MsgPing, nil)
+	frame := wsMessage(protocol.MsgLobbyPing, nil)
 	const batch = 64
 
 	b.ReportAllocs()
@@ -113,11 +142,11 @@ func BenchmarkWSPingBurst(b *testing.B) {
 		for range batch {
 			select {
 			case got := <-h.frames:
-				if typ, _ := frameType(got); typ != protocol.MsgPing {
+				if typ, _ := frameType(got); typ != protocol.MsgLobbyPing {
 					b.Fatalf("unexpected reply type 0x%02x", typ)
 				}
 			case <-time.After(2 * time.Second):
-				b.Fatal("timeout waiting for WS ping reply")
+				b.Fatal("timeout waiting for the WS ping reply")
 			}
 		}
 	}

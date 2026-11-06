@@ -256,10 +256,10 @@ func (d *sweepFixture) tick(tick int) {
 	}
 	body, notices := d.s.PopAckTick()
 	if body != nil {
-		d.s.ForEachPeer(func(p *Peer) { _ = p.SendMessage(protocol.MsgEndOfGameData, body) })
+		d.s.SendToAll(protocol.MsgEndOfGameData, body)
 	}
 	for _, notice := range notices {
-		d.s.ForEachPeer(func(p *Peer) { _ = p.SendMessage(protocol.MsgGameData, notice) })
+		d.s.SendToAll(protocol.MsgGameData, notice)
 	}
 	d.s.Tick()
 	d.ticks++
@@ -342,10 +342,16 @@ type sweepReading struct {
 // itself (frameOverhead included) and the bytes
 // the allocator HOLDS. Two different questions: the charged figure is the
 // formula's own unit, the real one is what the process pays for it.
+//
+// The real figure is the live blocks' capacity, because the frames of a block are
+// sub-slices of that block's buffer: a frame's own cap is the rest of its block
+// and summing it would count the same bytes once per frame.
 func storeFootprint(r *Replay) (charged, real int) {
 	for i := range r.frames {
 		charged += len(r.frames[i].Body) + frameOverhead
-		real += cap(r.frames[i].Body)
+	}
+	for _, b := range r.blocks {
+		real += cap(b)
 	}
 	real += cap(r.frames) * frameHeaderBytes
 	real += cap(r.blockAt) * 8 // one int per live block

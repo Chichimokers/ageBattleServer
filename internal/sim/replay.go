@@ -81,37 +81,29 @@ func (r replayRun) Window() Window {
 func replay(cap *Capture, cfg *server.Config, opts Options) (replayRun, error) {
 	run := replayRun{}
 	runCfg, dev := prepareConfig(cfg)
-	settle := settleFor(runCfg, opts)
+	settle := settleFor(runCfg, opts, captureHasObserver(cap))
 	run.Config, run.Deviations, run.Settle = runCfg, dev, settle
 	run.lastTruth = cap.lastTruthMoment()
 
-	// The settle has to cover the observer step's own period, and when it is that
-	// floor and not the three ticks it used to be, the report says so with the
-	// arithmetic. A reader who sees a harness reading on for 1,25 s past the last
-	// captured input has to be able to find out whether that is a fudge or a derived
-	// number, and a deviation that says "it is the step's period, here is the
-	// period" is the difference between the two.
-	if step := observerStepPeriod(runCfg) * simPeriod(runCfg); step > 3*simPeriod(runCfg) && step <= settle {
-		run.Deviations = append(run.Deviations, Deviation{
-			Field:    "settle window",
-			Recorded: "the capture says nothing about how long the recording was read past the last input",
-			Running:  settle.String(),
-			Why: fmt.Sprintf("the observer step is a phase of interval+1 ticks, not a rate: the stride cursor "+
-				"takes that many values and index 0 is served on the ticks where it is 0 "+
-				"(and internal/session's TestTheWorstPhaseCostsTheWholePeriod measures "+
-				"the bound). At %s of a simulation period and an interval of %d ticks that is %s, which is more "+
-				"than the three ticks the tick ack alone needs, so the settle is that instead. Reading on for "+
-				"less than the step's own period is what made an observer that activated at the end of a "+
-				"recording arrive with no frame at all, and the report called it a difference of the server",
-				simPeriod(runCfg), server.ObserverUpdateIntervalTicks(runCfg), step),
-		})
+	if d, ok := settleStepDeviation(runCfg, settle); ok {
+		run.Deviations = append(run.Deviations, d)
 	}
 
+	// The level is process-global and the replays run in parallel, so the restore
+	// is conditional: it only puts the old level back when nobody else has moved
+	// it since. Two replays that both set warning therefore leave the level where
+	// they found it, instead of the last one to finish restoring the level the
+	// first one found.
 	prevLevel := logger.GetGlobalLevel()
-	if lvl, err := logger.ParseLevel("warning"); err == nil {
-		logger.SetGlobalLevel(lvl)
+	quiet, qerr := logger.ParseLevel("warning")
+	if qerr == nil {
+		logger.SetGlobalLevel(quiet)
 	}
-	defer logger.SetGlobalLevel(prevLevel)
+	defer func() {
+		if qerr == nil && logger.GetGlobalLevel() == quiet {
+			logger.SetGlobalLevel(prevLevel)
+		}
+	}()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -415,15 +407,31 @@ func fileExists(path string) bool {
 // more so that the write the visit makes happens strictly inside the settle instead of
 // on its last instant, where the reader may not be scheduled yet. The floor and the
 // ceiling keep a 1 ms or a 10 s period from making it useless or endless.
-func settleFor(cfg *server.Config, opts Options) time.Duration {
+func settleFor(cfg *server.Config, opts Options, hasObserver bool) time.Duration {
 	if opts.Settle > 0 {
 		return opts.Settle
 	}
 	period := simPeriod(cfg)
 	settle := 3 * period
-	settle = max(settle, observerStepPeriod(cfg)*period)
+	// The observer step's period is only waited for when the capture has an
+	// observer to serve. It is a phase of interval+1 ticks, and a capture with no
+	// observer has no step to wait for: the tick ack alone needs three periods.
+	if hasObserver {
+		settle = max(settle, observerStepPeriod(cfg)*period)
+	}
 	settle = max(settle, 400*time.Millisecond)
 	return min(settle, 3*time.Second)
+}
+
+// captureHasObserver reports whether any connection of the capture asked to
+// observe, which is what makes the observer step's period part of the settle.
+func captureHasObserver(cap *Capture) bool {
+	for _, c := range cap.Conns {
+		if requestedObservation(c) {
+			return true
+		}
+	}
+	return false
 }
 
 // simPeriod is the simulation period as a duration: -simulationperiod, or the original's
@@ -441,6 +449,40 @@ func simPeriod(cfg *server.Config) time.Duration {
 // settleFor.
 func observerStepPeriod(cfg *server.Config) time.Duration {
 	return time.Duration(server.ObserverUpdateIntervalTicks(cfg)+2)
+}
+
+// settleStepDeviation is the deviation that explains a settle set by the observer
+// step's own period, and false when the settle is not that.
+//
+// The settle has to cover the step's period, and when it is that floor and not the
+// three ticks it used to be, the report says so with the arithmetic. A reader who
+// sees a harness reading on for 1,25 s past the last captured input has to be able
+// to find out whether that is a fudge or a derived number, and a deviation that
+// says "it is the step's period, here is the period" is the difference between the
+// two.
+//
+// It is a function of the configuration and the settle alone so a test can read the
+// words the report will carry without replaying a capture: the deviation is the
+// only place outside a test where that number is justified, and a report without it
+// is a harness change nobody can audit.
+func settleStepDeviation(cfg *server.Config, settle time.Duration) (Deviation, bool) {
+	step := observerStepPeriod(cfg) * simPeriod(cfg)
+	if step <= 3*simPeriod(cfg) || step > settle {
+		return Deviation{}, false
+	}
+	return Deviation{
+		Field:    "settle window",
+		Recorded: "the capture says nothing about how long the recording was read past the last input",
+		Running:  settle.String(),
+		Why: fmt.Sprintf("the observer step is a phase of interval+1 ticks, not a rate: the stride cursor "+
+			"takes that many values and index 0 is served on the ticks where it is 0 "+
+			"(and internal/session's TestTheWorstPhaseCostsTheWholePeriod measures "+
+			"the bound). At %s of a simulation period and an interval of %d ticks that is %s, which is more "+
+			"than the three ticks the tick ack alone needs, so the settle is that instead. Reading on for "+
+			"less than the step's own period is what made an observer that activated at the end of a "+
+			"recording arrive with no frame at all, and the report called it a difference of the server",
+			simPeriod(cfg), server.ObserverUpdateIntervalTicks(cfg), step),
+	}, true
 }
 
 // maxExtraSettleForTruth bounds how much longer settleForTruth will read past the

@@ -68,6 +68,29 @@ func TestInflatePeerPayloadKeepsWhatInflatedBeforeAnError(t *testing.T) {
 	}
 }
 
+// The reader and the output buffer are pooled, so the same reader is reset onto
+// a different stream and the same buffer is reused. A pooled reader that was not
+// fully reset would carry the previous stream's state into the next one, and a
+// buffer that was not cleared would leak the previous message's tail into a
+// shorter one. This walks a long message, a short one and a rejected one in that
+// order and checks each answer on its own.
+func TestInflatePeerPayloadReusesItsReaderAndBuffer(t *testing.T) {
+	long := append([]byte{PeerMsgRequestJoin}, bytes.Repeat([]byte("long"), 2000)...)
+	short := []byte{PeerMsgAddPeer, 0x01, 0x02}
+	for i := range 3 {
+		if got := InflatePeerPayload(deflate(t, long)); !bytes.Equal(got, long) {
+			t.Fatalf("round %d: the long message inflated to %d bytes, want %d", i, len(got), len(long))
+		}
+		if got := InflatePeerPayload(deflate(t, short)); !bytes.Equal(got, short) {
+			t.Fatalf("round %d: the short message inflated to %x, want %x: the buffer kept the previous "+
+				"message's tail", i, got, short)
+		}
+		if got := InflatePeerPayload([]byte{0x01, 0x02, 0x03, 0x04}); len(got) != 0 {
+			t.Fatalf("round %d: a non-zlib input inflated to %x, want nothing", i, got)
+		}
+	}
+}
+
 // ReadGameData reads tag, length and payload in that order and stops at the
 // first field that does not fit, leaving it empty. exact reports whether the
 // body was consumed to its last byte.

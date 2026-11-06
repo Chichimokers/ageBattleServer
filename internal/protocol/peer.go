@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 )
 
 // Peer-message (0x0F) envelope and the inner message types it carries.
@@ -128,6 +129,43 @@ const FlagCompressed = 0x04
 // server inflates into a buffer of this size and reads nothing past it.
 const MaxInflatedPeerPayload = 65535
 
+// inflateResetter is what compress/zlib's reader offers and what the pool needs:
+// the reader type itself is unexported, so the pool holds the io.ReadCloser
+// NewReader returns and resets it through the Reset method it has.
+type inflateResetter interface {
+	io.ReadCloser
+	Reset(r io.Reader, dict []byte) error
+}
+
+// emptyZlibStream is a valid, empty zlib stream. NewReader refuses an input that
+// is not a zlib header, so the pool is seeded from a stream that parses; every
+// later use resets the same reader onto the message's own bytes.
+var emptyZlibStream = func() []byte {
+	var b bytes.Buffer
+	w := zlib.NewWriter(&b)
+	_ = w.Close()
+	return b.Bytes()
+}()
+
+// inflateReaders and inflateBuffers reuse the zlib reader and the 64 KiB output
+// buffer InflatePeerPayload needs. Compressed messages are rare in a real match
+// (a RequestJoin, the first AddPeer), so this is not a hot path: it is what stops
+// a client that spams compressed messages from making a decompressor and 64 KiB
+// of garbage each.
+//
+// The buffer is pooled and the result is copied out of it, so the caller keeps
+// owning what it gets back and nothing has to be released.
+var (
+	inflateReaders = sync.Pool{New: func() any {
+		zr, err := zlib.NewReader(bytes.NewReader(emptyZlibStream))
+		if err != nil {
+			panic(err) // a constant, valid stream: unreachable
+		}
+		return zr.(inflateResetter)
+	}}
+	inflateBuffers = sync.Pool{New: func() any { b := make([]byte, MaxInflatedPeerPayload); return &b }}
+)
+
 // InflatePeerPayload inflates the zlib-compressed inner message of a peer
 // message whose flagBits carry FlagCompressed. It never fails: it returns the
 // bytes the stream produced, at most MaxInflatedPeerPayload of them.
@@ -139,14 +177,19 @@ const MaxInflatedPeerPayload = 65535
 // (not zlib at all, a header with no data) returns nothing, and the caller then
 // has no inner type to read.
 func InflatePeerPayload(compressed []byte) []byte {
-	zr, err := zlib.NewReader(bytes.NewReader(compressed))
-	if err != nil {
+	zr := inflateReaders.Get().(inflateResetter)
+	if err := zr.Reset(bytes.NewReader(compressed), nil); err != nil {
+		inflateReaders.Put(zr)
 		return nil
 	}
-	defer func() { _ = zr.Close() }()
-	buf := make([]byte, MaxInflatedPeerPayload)
+	bufp := inflateBuffers.Get().(*[]byte)
+	buf := *bufp
 	n, _ := io.ReadFull(zr, buf)
-	return buf[:n]
+	_ = zr.Close()
+	inflateReaders.Put(zr)
+	out := append([]byte(nil), buf[:n]...)
+	inflateBuffers.Put(bufp)
+	return out
 }
 
 // PeerEnvelope is a parsed 0x0F message: the reliability header plus the inner

@@ -221,10 +221,10 @@ func costTick(d *sweepFixture, tick, uploads, checksums int) {
 	}
 	body, notices := d.s.PopAckTick()
 	if body != nil {
-		d.s.ForEachPeer(func(p *Peer) { _ = p.SendMessage(protocol.MsgEndOfGameData, body) })
+		d.s.SendToAll(protocol.MsgEndOfGameData, body)
 	}
 	for _, notice := range notices {
-		d.s.ForEachPeer(func(p *Peer) { _ = p.SendMessage(protocol.MsgGameData, notice) })
+		d.s.SendToAll(protocol.MsgGameData, notice)
 	}
 	d.s.Tick()
 	d.ticks++
@@ -381,18 +381,19 @@ const (
 	// nanoseconds. It is deliberately loose and says so: it exists to catch a tick
 	// an order of magnitude more expensive, not a 10% regression, which is more
 	// than this machine's clock resolves honestly (the 34 measured 19 zeroed
-	// buckets out of 55 for a single tick). Measured 45 us at 32 peers, and 585 us
-	// under -race, whose shadow bookkeeping is a large multiple of the work; the
-	// ceiling is 3,4 times the larger of the two, and the exact per-tick statement
-	// in this file is the ALLOCATION count, which is a counter and not a clock.
+	// buckets out of 55 for a single tick). Measured 11,1 us at 32 peers, and
+	// 307 us under -race, whose shadow bookkeeping is a large multiple of the
+	// work; the ceiling is 6,5 times the larger of the two, and the exact per-tick
+	// statement in this file is the ALLOCATION count, which is a counter and not a
+	// clock.
 	costMaxNsPerTick = 2_000_000
 
 // costMaxNsPerTickPerPeer is the same figure as a slope over the peer count,
 	// which is what says the tick is not secretly quadratic in the peers. The tick
 	// walks the peers' queue records twice (queueEntries and the drain) and
-	// reconciles them once, so it is linear in the peers. Measured 1,4 us a peer
-	// and 11 us under -race, whose shadow bookkeeping is itself per peer per tick,
-	// so the bound is 2,7 times the larger of the two: enough to hold in both
+	// reconciles them once, so it is linear in the peers. Measured 0,34 us a peer
+	// and 9,34 us under -race, whose shadow bookkeeping is itself per peer per
+	// tick, so the bound is 3,2 times the larger of the two: enough to hold in both
 	// modes and still several times below what a pairwise reconciliation costs
 	// (the falsification is in SESSION-JOURNAL.md 38).
 	costMaxNsPerTickPerPeer = 30_000
@@ -400,26 +401,29 @@ const (
 	// costMaxAllocsPerPeerPerTick is the SLOPE of the allocation count against the
 	// peer count, over the points at or above the store's floor of eight. It is a
 	// slope and not a ratio because there is a fixed per-tick cost that does not
-	// scale with the peers (the ack body, the store's copy of it, the queue-record
-	// snapshot and the fixture's send closure: 4 objects at one peer, measured),
-	// and a ratio would read that fixed part as a per-peer cost.
+	// scale with the peers, and a ratio would read that fixed part as a per-peer
+	// cost.
 	//
 	// The 37 set this at 12,0 against a measured 9,30, and said in §37.9 that it
 	// caught "three or more extra allocations a peer" and deliberately let one or
 	// two through, because 9,30 and 9,81 were too close together for a tighter band
 	// to be about anything but the toolchain. That reason is gone: the per-peer
-	// allocations this path had are pooled or reused away (SESSION-JOURNAL.md 38)
-	// and the measured slope is now 0,00 without the detector and 0,50 with it, so
-	// the same sensitivity (three or more) sits at 3,0 with six times the margin over
-	// the race figure.
-	costMaxAllocsPerPeerPerTick = 3.0
+	// allocations this path had are pooled or reused away (SESSION-JOURNAL.md 38),
+	// the ack body is built inside the frame store's block and the queue-record
+	// snapshot is the session's own scratch, so the measured slope is 0,00 without
+	// the detector and 0,51 with it. The cap is 2,0: four times the race figure,
+	// and it fails on two extra objects a peer a tick.
+	costMaxAllocsPerPeerPerTick = 2.0
 
 	// costMaxBytesPerTick is the garbage one tick produces, at the largest peer
 	// count: the exact allocation rate (TotalAlloc, which counts every allocation
-	// whether or not the collector has taken it). Measured 11 KiB at 32 peers,
-	// which is 88 KiB a second of collector work at the recorded tick rate; the
-	// ceiling is 32 KiB, three times the measurement.
-	costMaxBytesPerTick = 32 << 10
+	// whether or not the collector has taken it). Measured 0 B at 32 peers, and
+	// 2,2 KiB under -race, whose shadow bookkeeping allocates per peer per tick.
+	// The ceiling is 12 KiB, which is no longer a tight bound on a measurement but
+	// a guard: it fails the moment a per-tick allocation comes back, which is what
+	// it was 32 KiB against 11 KiB for, when the ack body and the store's copy of
+	// it were both allocated every tick.
+	costMaxBytesPerTick = 12 << 10
 
 	// costMaxNsPerObserverVisit bounds ONE visit to one observer. It is a price per
 	// visit and not a share of the tick, because a share grows as the tick gets

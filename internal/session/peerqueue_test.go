@@ -385,7 +385,7 @@ func TestSaturatedPeerQueuesScaleWithThePeerCount(t *testing.T) {
 		}
 		// One 0x0A a tick to every peer, carrying the flushed subs: the queue going
 		// out on the wire is what makes "bounded" mean anything.
-		s.ForEachPeer(func(p *Peer) { _ = p.SendMessage(protocol.MsgEndOfGameData, body) })
+		s.SendToAll(protocol.MsgEndOfGameData, body)
 		if want := wantPerTick(tick); int(body[1]) != want {
 			t.Fatalf("tick %d flushed %d subs, want %d", tick+1, body[1], want)
 		}

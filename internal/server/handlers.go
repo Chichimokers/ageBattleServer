@@ -411,14 +411,10 @@ func (s *Server) sendEndOfGameDataTicks() {
 		// runs only after the 0x0A has already been sent. Each disagreeing
 		// round has its own notice, sent in round order.
 		if body != nil {
-			sess.ForEachPeer(func(p *session.Peer) {
-				s.sendToPeer(p.Conn, protocol.MsgEndOfGameData, body, false)
-			})
+			sess.SendToAll(protocol.MsgEndOfGameData, body)
 		}
 		for _, notice := range notices {
-			sess.ForEachPeer(func(p *session.Peer) {
-				s.sendToPeer(p.Conn, protocol.MsgGameData, notice, false)
-			})
+			sess.SendToAll(protocol.MsgGameData, notice)
 		}
 	}
 
@@ -864,10 +860,11 @@ func (s *Server) handleLobbyChecksumAck(client messageClient, body []byte, depth
 	slot := sess.PeerIDForConn(client)
 	if slot != 0 && sess.GetPeer(slot) != nil {
 		// There is one vector per peer, and the vectors are reconciled across
-		// peers on the tick.
-		entries := make([]byte, 8*n)
-		copy(entries, body[1:off])
-		sess.QueueChecksumEntries(slot, entries)
+		// peers on the tick. The entries are handed over as a window on the
+		// message: QueueEntries copies them into the peer's own buffer under its
+		// lock and retains nothing, so the copy this used to make first was a
+		// second copy of the same bytes on every checksum message.
+		sess.QueueChecksumEntries(slot, body[1:off])
 	}
 	if off < len(body) {
 		s.dispatch(client, body[off], body[off+1:], depth+1)
