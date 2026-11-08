@@ -26,7 +26,6 @@
 
 # IDE and editor temporary files
 .idea/
-.vscode/
 *.swp
 *.swo
 *~
@@ -46,3 +45,5 @@
 *.env
 
 docs/
+config.bat
+node_modules
